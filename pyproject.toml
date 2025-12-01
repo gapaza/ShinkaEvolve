@@ -46,6 +46,8 @@ dependencies = [
     "markdown",
     "aiofiles",
     "google-generativeai",
+    "datasets",
+    "tqdm",
 ]
 
 [tool.setuptools]
