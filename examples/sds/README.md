@@ -6,12 +6,14 @@ This example demonstrates how to use ShinkaEvolve for the SDS combinatorial opti
 
 - **`initial.py`**: Starting solution with `EVOLVE-BLOCK` markers. The `solve_sds()` function will be evolved.
 - **`evaluate.py`**: Evaluation script using ShinkaEvolve's `run_shinka_eval` pattern. Validates feasibility and calculates fitness.
-- **`run_evo.py`**: Example runner for single problem evolution using `EvolutionRunner`.
-- **`sds_task.py`**: Deprecated (kept for reference only).
+- **`run_evo.py`**: Standard evolution runner for solving a single SDS problem (same pattern as other examples).
+- **`run_sds_pipeline.py`**: **Optional** - Specialized pipeline for generating SFT training datasets. Only needed if you want to create datasets with reasoning traces for model training.
 
 ## Usage
 
-### Single Problem Evolution
+### Standard Evolution (Single Problem)
+
+For solving a single SDS problem, use `run_evo.py` just like other ShinkaEvolve examples:
 
 ```bash
 # Set problem data via environment variable
@@ -22,7 +24,16 @@ cd examples/sds
 python run_evo.py
 ```
 
-### Batch Dataset Generation
+This follows the standard ShinkaEvolve pattern: `initial.py` + `evaluate.py` + `run_evo.py`.
+
+### Dataset Generation (Optional)
+
+**Only needed if you want to generate SFT training datasets.** The pipeline script automates:
+- Generating multiple problem instances
+- Running evolution for each
+- Extracting best solutions
+- Generating reasoning traces
+- Formatting training data
 
 Use the pipeline script:
 
