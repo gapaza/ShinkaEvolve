@@ -1,6 +1,5 @@
 import os
 import openai
-import google.generativeai as genai
 import pandas as pd
 from typing import Union, List, Optional, Tuple
 import numpy as np
@@ -50,6 +49,8 @@ def get_client_model(model_name: str) -> tuple[Union[openai.OpenAI, str], str]:
             azure_endpoint=os.getenv("AZURE_API_ENDPOINT"),
         )
     elif model_name in GEMINI_EMBEDDING_MODELS:
+        # Lazy import to avoid protobuf conflicts when only using OpenAI models
+        import google.generativeai as genai
         # Configure Gemini API
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
@@ -98,6 +99,8 @@ class EmbeddingClient:
             single_code = False
         # Handle Gemini models
         if self.model_name in GEMINI_EMBEDDING_MODELS:
+            # Lazy import to avoid protobuf conflicts when only using OpenAI models
+            import google.generativeai as genai
             try:
                 embeddings = []
                 total_tokens = 0
