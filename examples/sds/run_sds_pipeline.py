@@ -72,7 +72,7 @@ Be creative and find efficient solutions that maximize the objective while respe
         max_patch_attempts=3,
         job_type="local",
         language="python",
-        llm_models=["gpt-4o"],
+        llm_models=["gpt-5-mini"],
         llm_kwargs=dict(
             temperatures=[0.0, 0.5, 0.7],
             max_tokens=8192,
