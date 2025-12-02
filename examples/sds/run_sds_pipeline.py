@@ -19,6 +19,14 @@ import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
 from datasets import Dataset
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Try to import tiktoken for accurate token counting
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
 
 # Calculate paths: script is in deps/ShinkaEvolve/examples/sds/
 # Project root is 4 levels up
@@ -86,7 +94,7 @@ Be creative and find efficient solutions that maximize the objective while respe
         max_patch_attempts=3,
         job_type="local",
         language="python",
-        llm_models=["gpt-5-mini"],
+        llm_models=["gpt-5-nano","gpt-5-mini"],
         llm_kwargs=dict(
             temperatures=[0.0, 0.5, 0.7],
             max_tokens=8192,
@@ -112,6 +120,195 @@ def create_sds_database_config() -> DatabaseConfig:
         parent_selection_strategy="weighted",
         parent_selection_lambda=10.0,
     )
+
+
+def count_tokens(text: str) -> int:
+    """
+    Count tokens in text using tiktoken if available, otherwise use approximation.
+    
+    Args:
+        text: Text to count tokens for
+    
+    Returns:
+        Approximate token count
+    """
+    if TIKTOKEN_AVAILABLE:
+        try:
+            # Use cl100k_base encoding (GPT-4, GPT-3.5-turbo)
+            # This is a reasonable approximation for most modern tokenizers
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except Exception:
+            # Fall back to approximation if encoding fails
+            pass
+    
+    # Simple approximation: ~4 characters per token (common for English)
+    # This is a rough estimate but better than nothing
+    return len(text) // 4
+
+
+def process_single_problem(
+    i: int,
+    master_seed: int,
+    num_generations: int,
+    script_dir: Path,
+    output_dir: Path,
+    api_key: str,
+) -> dict:
+    """
+    Process a single SDS problem through ShinkaEvolve evolution.
+    
+    This function is designed to be called in parallel across multiple problems.
+    Each problem gets its own isolated environment (results directory, database, etc.).
+    
+    Args:
+        i: Problem index (0-based)
+        master_seed: Master seed for reproducibility
+        num_generations: Number of evolution generations
+        script_dir: Path to script directory (for initial.py, evaluate.py)
+        output_dir: Base output directory
+        api_key: OpenAI API key for trace generation
+    
+    Returns:
+        dict: Dataset record if successful, None if failed
+    """
+    try:
+        # Calculate deterministic seed for this problem
+        # This ensures problem i always gets the same seed regardless of execution order
+        problem_gen_seed = master_seed + i if master_seed is not None else i
+        
+        # Use the seed to create a deterministic RNG for problem size selection
+        rng_for_size = random.Random(problem_gen_seed)
+        
+        # A. Generate a Problem Instance (deterministic when seed is set)
+        # Use same HARD parameters as GRPO dataset generation for consistency
+        ptype = "dense" if i % 2 == 0 else "tree"
+        n_size = rng_for_size.randint(15, 25)  # Deterministic when seed is set
+        
+        # Calculate cardinality bounds (matching GRPO dataset generation)
+        if ptype == "dense":
+            card = (max(3, n_size//3), min(n_size, n_size//2 + 4))
+            # HARD: Weak unaries (2.0), Massive interactions (20.0)
+            # Mixed signs (0.4/0.4) = Frustration (greedy fails)
+            inst = make_dense_instance(
+                n=n_size,
+                card=card,
+                weight_scale=2.0,    # Weak unaries (default is 8.0)
+                pair_scale=20.0,    # Strong interactions (default is 6.0)
+                pos_pair_frac=0.4,  # Mixed signs = Frustration
+                neg_pair_frac=0.4,
+                seed=problem_gen_seed
+            )
+        else:  # tree
+            card = (max(3, n_size//3), min(n_size, n_size//2 + 4))
+            # HARD: Very weak unaries (1.0), Very strong interactions (25.0)
+            inst = make_tree_instance(
+                n=n_size,
+                card=card,
+                weight_scale=1.0,   # Very weak unaries (default is 10.0)
+                pair_scale=25.0,    # Very strong interactions (default is 6.0)
+                seed=problem_gen_seed
+            )
+        
+        problem_dict = _instance_to_problem(inst, ptype, i)
+        prompt_data = sds_render_prompt(problem_dict)
+        
+        # B. Set up evolution for this problem
+        # Create unique results directory for this problem
+        problem_results_dir = output_dir / f"problem_{i}"
+        problem_results_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Set environment variable for evaluate.py to use (isolated per worker)
+        os.environ["SDS_PROBLEM_DATA"] = json.dumps(problem_dict)
+        
+        # Create configs with absolute paths
+        # Ensure results_dir is absolute so it works regardless of working directory
+        evo_config = create_sds_evolution_config(
+            problem_dict,
+            num_generations=num_generations,
+            results_dir=str(problem_results_dir.resolve()),
+            script_dir=script_dir,
+        )
+        db_config = create_sds_database_config()
+        # EvolutionRunner will prepend results_dir, so just use filename
+        db_config.db_path = "evolution_db.sqlite"
+        
+        job_config = LocalJobConfig(
+            eval_program_path=str(script_dir / "evaluate.py")
+        )
+        
+        # C. Run Shinka Evolution
+        # Change to script directory so relative paths in evaluate.py work correctly
+        # Note: Evolution uses natural randomness to explore diverse solutions
+        # and avoid mode collapse. Problem generation is seeded for reproducibility.
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(script_dir)  # Change to script directory for evolution
+            evo_runner = EvolutionRunner(
+                evo_config=evo_config,
+                job_config=job_config,
+                db_config=db_config,
+                verbose=False,  # Less verbose for batch processing
+            )
+            evo_runner.run()
+        except Exception as e:
+            print(f"   ⚠️ Evolution failed for problem {i}: {e}")
+            return None
+        finally:
+            os.chdir(original_cwd)  # Restore original working directory
+        
+        # D. Extract best solution from database
+        # EvolutionRunner creates db at results_dir/db_path (see runner.py line 140)
+        # Since results_dir is absolute and db_config.db_path is "evolution_db.sqlite",
+        # the final path is: results_dir / "evolution_db.sqlite"
+        db_path = problem_results_dir.resolve() / "evolution_db.sqlite"
+        
+        # Verify the path exists (EvolutionRunner should have created it)
+        if not db_path.exists():
+            print(f"   ⚠️ Database not found at {db_path} for problem {i}")
+            return None
+        
+        best_code, best_fitness = extract_best_code_from_database(str(db_path))
+        
+        if not best_code or best_fitness <= 0.01:
+            print(f"   ⚠️ Skipping {i}: No valid solution found (fitness: {best_fitness:.4f})")
+            return None
+        
+        # E. Generate Thinking Trace
+        # Create trace generator per worker (thread-safe)
+        tracer = TraceGenerator(api_key=api_key, model="gpt-5-mini")
+        trace = tracer.generate(prompt_data["problem"], best_code)
+        
+        # F. Format Entry for Student Training
+        full_content = (
+            f"<think>\n{trace}\n</think>\n\n"
+            f"<code>\n{best_code}\n</code>"
+        )
+        
+        # Calculate token counts
+        user_tokens = count_tokens(prompt_data["problem"])
+        assistant_tokens = count_tokens(full_content)
+        total_tokens = user_tokens + assistant_tokens
+        
+        return {
+            "problem_id": prompt_data.get("uuid", f"problem_{i}"),
+            "messages": [
+                {"role": "user", "content": prompt_data["problem"]},
+                {"role": "assistant", "content": full_content}
+            ],
+            "score": float(best_fitness),
+            "type": ptype,
+            "mission": json.dumps(problem_dict.get("mission", {})),
+            "index": i,  # Keep track of original index for sorting
+            "num_tokens": total_tokens,  # Total tokens (user + assistant)
+            "num_tokens_user": user_tokens,  # User prompt tokens
+            "num_tokens_assistant": assistant_tokens,  # Assistant response tokens
+        }
+    except Exception as e:
+        print(f"   ❌ Error processing problem {i}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def extract_best_code_from_database(db_path: str) -> tuple[str, float]:
@@ -170,6 +367,12 @@ def main():
         help="Master seed for reproducibility. Seeds problem generation deterministically. "
              "Evolution uses natural randomness to ensure diversity and avoid mode collapse."
     )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Number of parallel workers for problem processing. "
+             "If not specified, defaults to number of CPU cores. "
+             "Set to 1 for sequential processing."
+    )
     args = parser.parse_args()
     
     load_dotenv()
@@ -191,154 +394,77 @@ def main():
     else:
         print("⚠️  No seed provided - results will not be reproducible")
     
-    # Initialize trace generator
-    tracer = TraceGenerator(api_key=api_key, model="gpt-4o")
-    
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     dataset_records = []
     
+    # Determine number of workers
+    if args.workers is None:
+        import multiprocessing
+        num_workers = multiprocessing.cpu_count()
+    else:
+        num_workers = max(1, args.workers)
+    
     print(f"🚀 Starting Pipeline: {args.samples} samples")
     print(f"📁 Output directory: {output_dir}")
+    print(f"⚡ Using {num_workers} parallel workers")
     
-    # Loop through desired samples
-    for i in tqdm.tqdm(range(args.samples), desc="Generating samples"):
-        # Seed problem generation deterministically (reproducible problems)
-        # Each problem gets a unique seed: master_seed + i
-        # This ensures: (1) different problems for different i, (2) same problems when rerun with same master_seed
-        if master_seed is not None:
-            problem_gen_seed = master_seed + i
-        else:
-            problem_gen_seed = i
-        
-        # Use the seed to create a deterministic RNG for problem size selection
-        # This ensures n_size is reproducible but varies across problems
-        rng_for_size = random.Random(problem_gen_seed)
-        
-        # A. Generate a Problem Instance (deterministic when seed is set)
-        # Use same HARD parameters as GRPO dataset generation for consistency
-        ptype = "dense" if i % 2 == 0 else "tree"
-        n_size = rng_for_size.randint(15, 25)  # Deterministic when seed is set
-        
-        # Calculate cardinality bounds (matching GRPO dataset generation)
-        if ptype == "dense":
-            card = (max(3, n_size//3), min(n_size, n_size//2 + 4))
-            # HARD: Weak unaries (2.0), Massive interactions (20.0)
-            # Mixed signs (0.4/0.4) = Frustration (greedy fails)
-            inst = make_dense_instance(
-                n=n_size,
-                card=card,
-                weight_scale=2.0,    # Weak unaries (default is 8.0)
-                pair_scale=20.0,    # Strong interactions (default is 6.0)
-                pos_pair_frac=0.4,  # Mixed signs = Frustration
-                neg_pair_frac=0.4,
-                seed=problem_gen_seed
+    # Process problems in parallel
+    if num_workers == 1:
+        # Sequential processing (easier debugging)
+        print("🔄 Running in sequential mode (workers=1)")
+        for i in tqdm.tqdm(range(args.samples), desc="Generating samples"):
+            result = process_single_problem(
+                i=i,
+                master_seed=master_seed,
+                num_generations=args.generations,
+                script_dir=script_dir,
+                output_dir=output_dir,
+                api_key=api_key,
             )
-        else:  # tree
-            card = (max(3, n_size//3), min(n_size, n_size//2 + 4))
-            # HARD: Very weak unaries (1.0), Very strong interactions (25.0)
-            inst = make_tree_instance(
-                n=n_size,
-                card=card,
-                weight_scale=1.0,   # Very weak unaries (default is 10.0)
-                pair_scale=25.0,    # Very strong interactions (default is 6.0)
-                seed=problem_gen_seed
-            )
-        
-        problem_dict = _instance_to_problem(inst, ptype, i)
-        prompt_data = sds_render_prompt(problem_dict)
-        
-        # B. Set up evolution for this problem
-        # Create unique results directory for this problem
-        problem_results_dir = output_dir / f"problem_{i}"
-        problem_results_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Set environment variable for evaluate.py to use
-        os.environ["SDS_PROBLEM_DATA"] = json.dumps(problem_dict)
-        
-        # Create configs with absolute paths
-        # Ensure results_dir is absolute so it works regardless of working directory
-        evo_config = create_sds_evolution_config(
-            problem_dict,
-            num_generations=args.generations,
-            results_dir=str(problem_results_dir.resolve()),
-            script_dir=script_dir,
-        )
-        db_config = create_sds_database_config()
-        # EvolutionRunner will prepend results_dir, so just use filename
-        db_config.db_path = "evolution_db.sqlite"
-        
-        job_config = LocalJobConfig(
-            eval_program_path=str(script_dir / "evaluate.py")
-        )
-        
-        # C. Run Shinka Evolution
-        # Change to script directory so relative paths in evaluate.py work correctly
-        # Note: Evolution uses natural randomness to explore diverse solutions
-        # and avoid mode collapse. Problem generation is seeded for reproducibility.
-        print(f"\n🔬 Running evolution for problem {i} ({ptype})...")
-        original_cwd = os.getcwd()
-        try:
-            os.chdir(script_dir)  # Change to script directory for evolution
-            evo_runner = EvolutionRunner(
-                evo_config=evo_config,
-                job_config=job_config,
-                db_config=db_config,
-                verbose=False,  # Less verbose for batch processing
-            )
-            evo_runner.run()
-        except Exception as e:
-            print(f"   ⚠️ Evolution failed for problem {i}: {e}")
-            continue
-        finally:
-            os.chdir(original_cwd)  # Restore original working directory
-        
-        # D. Extract best solution from database
-        # EvolutionRunner creates db at results_dir/db_path (see runner.py line 140)
-        # Since results_dir is absolute and db_config.db_path is "evolution_db.sqlite",
-        # the final path is: results_dir / "evolution_db.sqlite"
-        db_path = problem_results_dir.resolve() / "evolution_db.sqlite"
-        
-        # Verify the path exists (EvolutionRunner should have created it)
-        if not db_path.exists():
-            print(f"   ⚠️ Database not found at {db_path}")
-            print(f"   ⚠️ Expected location: {db_path}")
-            print(f"   ⚠️ Results dir: {problem_results_dir.resolve()}")
-            print(f"   ⚠️ Skipping {i}: Database file not found")
-            continue
-        
-        best_code, best_fitness = extract_best_code_from_database(str(db_path))
-        
-        if not best_code or best_fitness <= 0.01:
-            print(f"   ⚠️ Skipping {i}: No valid solution found (fitness: {best_fitness:.4f})")
-            continue
-        
-        # E. Generate Thinking Trace
-        print(f"   📝 Generating trace for problem {i}...")
-        trace = tracer.generate(prompt_data["problem"], best_code)
-        
-        # F. Format Entry for Student Training
-        full_content = (
-            f"<think>\n{trace}\n</think>\n\n"
-            f"<code>\n{best_code}\n</code>"
-        )
-        
-        dataset_records.append({
-            "problem_id": prompt_data.get("uuid", f"problem_{i}"),
-            "messages": [
-                {"role": "user", "content": prompt_data["problem"]},
-                {"role": "assistant", "content": full_content}
-            ],
-            "score": float(best_fitness),
-            "type": ptype,
-            "mission": json.dumps(problem_dict.get("mission", {}))
-        })
-        
-        print(f"   ✅ Problem {i} completed (fitness: {best_fitness:.4f})")
+            if result is not None:
+                dataset_records.append(result)
+    else:
+        # Parallel processing
+        print(f"⚡ Running in parallel mode ({num_workers} workers)")
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all problems
+            future_to_index = {
+                executor.submit(
+                    process_single_problem,
+                    i=i,
+                    master_seed=master_seed,
+                    num_generations=args.generations,
+                    script_dir=script_dir,
+                    output_dir=output_dir,
+                    api_key=api_key,
+                ): i
+                for i in range(args.samples)
+            }
+            
+            # Collect results as they complete (with progress bar)
+            completed_results = {}
+            with tqdm.tqdm(total=args.samples, desc="Generating samples") as pbar:
+                for future in as_completed(future_to_index):
+                    i = future_to_index[future]
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            completed_results[i] = result
+                    except Exception as e:
+                        print(f"   ❌ Problem {i} failed with exception: {e}")
+                    finally:
+                        pbar.update(1)
+            
+            # Sort by original index to maintain deterministic order
+            dataset_records = [
+                completed_results[i] 
+                for i in sorted(completed_results.keys())
+            ]
     
-    print(f"\n✅ Generated {len(dataset_records)} high-quality samples.")
+    print(f"\n✅ Generated {len(dataset_records)} high-quality samples out of {args.samples} attempted.")
     
     # G. Save or Push Dataset
     if len(dataset_records) > 0:
