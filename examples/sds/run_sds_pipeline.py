@@ -16,6 +16,7 @@ import tqdm
 import sys
 import random
 import numpy as np
+import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
 from datasets import Dataset
@@ -122,6 +123,27 @@ def create_sds_database_config() -> DatabaseConfig:
     )
 
 
+def get_deterministic_seed(*args):
+    """
+    Creates a unique 32-bit integer seed from any number of arguments.
+    Ensures no overlap between runs (e.g., Seed 101 vs 202).
+    
+    This matches the implementation in rewards_unified_v2.py for consistency.
+    
+    Args:
+        *args: Any number of arguments to combine into a seed
+        
+    Returns:
+        int: 32-bit integer seed
+    """
+    # Combine all args into a single unique string
+    seed_str = "_".join(str(arg) for arg in args)
+    # Hash it (SHA256 is robust enough to prevent collision)
+    hash_bytes = hashlib.sha256(seed_str.encode('utf-8')).digest()
+    # Convert to integer and clip to 32-bit (standard for numpy/random)
+    return int.from_bytes(hash_bytes[:4], byteorder='big')
+
+
 def count_tokens(text: str) -> int:
     """
     Count tokens in text using tiktoken if available, otherwise use approximation.
@@ -173,9 +195,15 @@ def process_single_problem(
         dict: Dataset record if successful, None if failed
     """
     try:
-        # Calculate deterministic seed for this problem
-        # This ensures problem i always gets the same seed regardless of execution order
-        problem_gen_seed = master_seed + i if master_seed is not None else i
+        # Calculate deterministic seed for this problem using hash-based seeding
+        # This ensures:
+        # 1. Problem i always gets the same seed regardless of execution order
+        # 2. No overlap between different master seeds (e.g., seed 101 problem 102 vs seed 202 problem 1)
+        # 3. Matches the approach used in generalization reward for consistency
+        if master_seed is not None:
+            problem_gen_seed = get_deterministic_seed(master_seed, i)
+        else:
+            problem_gen_seed = i
         
         # Use the seed to create a deterministic RNG for problem size selection
         rng_for_size = random.Random(problem_gen_seed)
