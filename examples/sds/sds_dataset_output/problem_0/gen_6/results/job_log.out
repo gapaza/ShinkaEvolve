@@ -1,0 +1,21 @@
+Evaluating program: sds_dataset_output/problem_0/gen_6/main.py
+Saving results to: sds_dataset_output/problem_0/gen_6/results
+Run 1/1 completed in 0.00 seconds
+Correctness and error status saved to sds_dataset_output/problem_0/gen_6/results/correct.json
+Metrics saved to sds_dataset_output/problem_0/gen_6/results/metrics.json
+Evaluation and Validation completed successfully.
+Metrics:
+  combined_score: 0.3993475858389672
+  public:
+    feasible: True
+    selection_size: 10
+    raw_score: 122.54942718671678
+  private:
+    selection: [3, 4, 5, 6, 7, 9, 10, 11, 13, 14]
+    raw_score: 122.54942718671678
+    normalized_fitness: 0.3993475858389672
+  execution_time_mean: 0.0006457919998865691
+  execution_time_std: 0.0
+  num_valid_runs: 1
+  num_invalid_runs: 0
+  all_validation_errors: []

@@ -20,18 +20,30 @@ from pathlib import Path
 from dotenv import load_dotenv
 from datasets import Dataset
 
+# Calculate paths: script is in deps/ShinkaEvolve/examples/sds/
+# Project root is 4 levels up
+script_dir = Path(__file__).parent.resolve()
+project_root = script_dir.parent.parent.parent.parent
+
+# Add project root to Python path for imports (like ShinkaEvolve tutorial)
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 # ShinkaEvolve imports
 from shinka.core import EvolutionRunner, EvolutionConfig
 from shinka.database import DatabaseConfig, ProgramDatabase
 from shinka.launch import LocalJobConfig
 from shinka.annotation.trace_generator import TraceGenerator
 
-# Import problem generation (assumed to exist)
+# Import problem generation from data directory
 try:
-    from gen_sds_dataset import sds_render_prompt, _instance_to_problem
-    from gen_sds_dataset import make_dense_instance, make_tree_instance
+    from data.gen_sds_dataset import sds_render_prompt, _instance_to_problem
+    from data.gen_sds_dataset import make_dense_instance, make_tree_instance
 except ImportError:
-    print("❌ Could not import gen_sds_dataset.py. Make sure it is in the path.")
+    print(f"❌ Could not import gen_sds_dataset.py.")
+    print(f"   Script dir: {script_dir}")
+    print(f"   Project root: {project_root}")
+    print(f"   Looking for: {project_root / 'data' / 'gen_sds_dataset.py'}")
     sys.exit(1)
 
 
@@ -39,6 +51,7 @@ def create_sds_evolution_config(
     problem_data: dict,
     num_generations: int = 10,
     results_dir: str = None,
+    script_dir: Path = None,
 ) -> EvolutionConfig:
     """Create EvolutionConfig for SDS problem."""
     
@@ -79,7 +92,7 @@ Be creative and find efficient solutions that maximize the objective while respe
             max_tokens=8192,
         ),
         embedding_model="text-embedding-3-small",
-        init_program_path="initial.py",  # Relative to current directory
+        init_program_path=str(script_dir / "initial.py") if script_dir else "initial.py",
         results_dir=results_dir,
     )
 
@@ -105,10 +118,18 @@ def extract_best_code_from_database(db_path: str) -> tuple[str, float]:
     """
     Extract the best solution code and score from the evolution database.
     
+    Args:
+        db_path: Absolute path to the database file
+    
     Returns:
         (code: str, combined_score: float)
     """
-    db_config = DatabaseConfig(db_path=db_path)
+    # Ensure db_path is absolute
+    db_path_abs = Path(db_path).resolve()
+    if not db_path_abs.exists():
+        raise FileNotFoundError(f"Database file not found: {db_path_abs}")
+    
+    db_config = DatabaseConfig(db_path=str(db_path_abs))
     db = ProgramDatabase(config=db_config, read_only=True)
     
     best_program = db.get_best_program()
@@ -185,18 +206,46 @@ def main():
     # Loop through desired samples
     for i in tqdm.tqdm(range(args.samples), desc="Generating samples"):
         # Seed problem generation deterministically (reproducible problems)
+        # Each problem gets a unique seed: master_seed + i
+        # This ensures: (1) different problems for different i, (2) same problems when rerun with same master_seed
         if master_seed is not None:
-            problem_seed = master_seed + i
-            random.seed(problem_seed)  # Seed for this problem's generation
+            problem_gen_seed = master_seed + i
+        else:
+            problem_gen_seed = i
+        
+        # Use the seed to create a deterministic RNG for problem size selection
+        # This ensures n_size is reproducible but varies across problems
+        rng_for_size = random.Random(problem_gen_seed)
         
         # A. Generate a Problem Instance (deterministic when seed is set)
+        # Use same HARD parameters as GRPO dataset generation for consistency
         ptype = "dense" if i % 2 == 0 else "tree"
-        n_size = random.randint(15, 25)  # Deterministic when seed is set
-        problem_gen_seed = problem_seed if master_seed is not None else i
+        n_size = rng_for_size.randint(15, 25)  # Deterministic when seed is set
+        
+        # Calculate cardinality bounds (matching GRPO dataset generation)
         if ptype == "dense":
-            inst = make_dense_instance(n=n_size, seed=problem_gen_seed)
-        else:
-            inst = make_tree_instance(n=n_size, seed=problem_gen_seed)
+            card = (max(3, n_size//3), min(n_size, n_size//2 + 4))
+            # HARD: Weak unaries (2.0), Massive interactions (20.0)
+            # Mixed signs (0.4/0.4) = Frustration (greedy fails)
+            inst = make_dense_instance(
+                n=n_size,
+                card=card,
+                weight_scale=2.0,    # Weak unaries (default is 8.0)
+                pair_scale=20.0,    # Strong interactions (default is 6.0)
+                pos_pair_frac=0.4,  # Mixed signs = Frustration
+                neg_pair_frac=0.4,
+                seed=problem_gen_seed
+            )
+        else:  # tree
+            card = (max(3, n_size//3), min(n_size, n_size//2 + 4))
+            # HARD: Very weak unaries (1.0), Very strong interactions (25.0)
+            inst = make_tree_instance(
+                n=n_size,
+                card=card,
+                weight_scale=1.0,   # Very weak unaries (default is 10.0)
+                pair_scale=25.0,    # Very strong interactions (default is 6.0)
+                seed=problem_gen_seed
+            )
         
         problem_dict = _instance_to_problem(inst, ptype, i)
         prompt_data = sds_render_prompt(problem_dict)
@@ -209,41 +258,58 @@ def main():
         # Set environment variable for evaluate.py to use
         os.environ["SDS_PROBLEM_DATA"] = json.dumps(problem_dict)
         
-        # Create configs
+        # Create configs with absolute paths
+        # Ensure results_dir is absolute so it works regardless of working directory
         evo_config = create_sds_evolution_config(
             problem_dict,
             num_generations=args.generations,
-            results_dir=str(problem_results_dir),
+            results_dir=str(problem_results_dir.resolve()),
+            script_dir=script_dir,
         )
         db_config = create_sds_database_config()
         # EvolutionRunner will prepend results_dir, so just use filename
         db_config.db_path = "evolution_db.sqlite"
         
         job_config = LocalJobConfig(
-            eval_program_path="evaluate.py"  # Relative to current directory
+            eval_program_path=str(script_dir / "evaluate.py")
         )
         
         # C. Run Shinka Evolution
+        # Change to script directory so relative paths in evaluate.py work correctly
         # Note: Evolution uses natural randomness to explore diverse solutions
         # and avoid mode collapse. Problem generation is seeded for reproducibility.
         print(f"\n🔬 Running evolution for problem {i} ({ptype})...")
-        evo_runner = EvolutionRunner(
-            evo_config=evo_config,
-            job_config=job_config,
-            db_config=db_config,
-            verbose=False,  # Less verbose for batch processing
-        )
-        
+        original_cwd = os.getcwd()
         try:
+            os.chdir(script_dir)  # Change to script directory for evolution
+            evo_runner = EvolutionRunner(
+                evo_config=evo_config,
+                job_config=job_config,
+                db_config=db_config,
+                verbose=False,  # Less verbose for batch processing
+            )
             evo_runner.run()
         except Exception as e:
             print(f"   ⚠️ Evolution failed for problem {i}: {e}")
             continue
+        finally:
+            os.chdir(original_cwd)  # Restore original working directory
         
         # D. Extract best solution from database
-        # EvolutionRunner creates db at results_dir/db_path
-        db_path = str(problem_results_dir / "evolution_db.sqlite")
-        best_code, best_fitness = extract_best_code_from_database(db_path)
+        # EvolutionRunner creates db at results_dir/db_path (see runner.py line 140)
+        # Since results_dir is absolute and db_config.db_path is "evolution_db.sqlite",
+        # the final path is: results_dir / "evolution_db.sqlite"
+        db_path = problem_results_dir.resolve() / "evolution_db.sqlite"
+        
+        # Verify the path exists (EvolutionRunner should have created it)
+        if not db_path.exists():
+            print(f"   ⚠️ Database not found at {db_path}")
+            print(f"   ⚠️ Expected location: {db_path}")
+            print(f"   ⚠️ Results dir: {problem_results_dir.resolve()}")
+            print(f"   ⚠️ Skipping {i}: Database file not found")
+            continue
+        
+        best_code, best_fitness = extract_best_code_from_database(str(db_path))
         
         if not best_code or best_fitness <= 0.01:
             print(f"   ⚠️ Skipping {i}: No valid solution found (fitness: {best_fitness:.4f})")

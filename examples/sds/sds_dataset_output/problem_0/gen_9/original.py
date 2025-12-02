@@ -1,0 +1,300 @@
+"""
+Initial solution for Synergistic Dependency Selection (SDS) problem.
+The code in EVOLVE-BLOCK will be evolved by ShinkaEvolve.
+"""
+
+import json
+import sys
+import contextlib
+
+# EVOLVE-BLOCK-START
+def solve_sds():
+    """
+    Crossover solver for the Synergistic Dependency Selection problem.
+
+    Reads JSON from stdin with "requirements" and "catalog", and prints JSON
+    with "selection": {"variables": [...] }.
+
+    Strategy:
+    - Parse inputs robustly.
+    - Build adjacency map for interactions for efficient marginal gain computation.
+    - Precompute transitive ancestor closure for precedence.
+    - For each candidate, consider adding its closure (itself + ancestors).
+    - Greedily add the closure with maximum marginal gain while respecting
+      mutex, groups, and cardinality. Tie-break in favor of larger closures to
+      satisfy minimum cardinality.
+    - If minimum cardinality not reached, add best feasible closures even if negative.
+    - Trim if needed by approximate item scores.
+    """
+    import re
+    from collections import defaultdict, deque
+
+    data = json.load(sys.stdin)
+    requirements = data.get("requirements", {}) or {}
+    catalog = data.get("catalog", {}) or {}
+
+    weights = list(requirements.get("weights", []) or [])
+    raw_interactions = requirements.get("interactions", {}) or {}
+    card_bounds = requirements.get("cardinality_bounds", [0, len(weights)]) or [0, len(weights)]
+    min_card = int(card_bounds[0]) if len(card_bounds) > 0 else 0
+    max_card = int(card_bounds[1]) if len(card_bounds) > 1 else len(weights)
+    mutex_list = requirements.get("mutex", []) or []
+    groups = requirements.get("groups", {}) or {}
+    precedence = requirements.get("precedence", []) or []
+
+    n = len(weights)
+
+    # Parse interactions into adjacency dict: interactions[u][v] = value
+    interactions = defaultdict(dict)
+    def parse_key(k):
+        # return (u,v) or None
+        try:
+            if isinstance(k, str):
+                parts = re.split(r'\s*,\s*|\s+', k.strip())
+                if len(parts) >= 2:
+                    return int(parts[0]), int(parts[1])
+            elif isinstance(k, (list, tuple)) and len(k) >= 2:
+                return int(k[0]), int(k[1])
+            elif isinstance(k, int):
+                return None
+        except Exception:
+            return None
+        return None
+
+    for k, v in raw_interactions.items():
+        parsed = parse_key(k)
+        try:
+            val = float(v)
+        except Exception:
+            continue
+        if parsed is None:
+            continue
+        u, w = parsed
+        if 0 <= u < n and 0 <= w < n:
+            interactions[u][w] = interactions[u].get(w, 0.0) + val
+            interactions[w][u] = interactions[w].get(u, 0.0) + val
+
+    # Build mutex map for quick conflict checks
+    mutex_map = defaultdict(set)
+    for pair in mutex_list:
+        try:
+            a, b = pair
+            a = int(a); b = int(b)
+            if 0 <= a < n and 0 <= b < n:
+                mutex_map[a].add(b)
+                mutex_map[b].add(a)
+        except Exception:
+            continue
+
+    # Normalize groups: map var -> group name, allow string/int keys
+    var_to_group = {}
+    for gname, vars_list in groups.items():
+        for v in vars_list:
+            try:
+                idx = int(v)
+                if 0 <= idx < n and gname is not None:
+                    # first membership wins
+                    if idx not in var_to_group:
+                        var_to_group[idx] = str(gname)
+            except Exception:
+                continue
+
+    # Build precedence graph (directed: p -> j means p is prerequisite of j)
+    preds = defaultdict(set)
+    succs = defaultdict(set)
+    for entry in precedence:
+        try:
+            a, b = entry
+            a = int(a); b = int(b)
+            if 0 <= a < n and 0 <= b < n:
+                preds[b].add(a)
+                succs[a].add(b)
+        except Exception:
+            continue
+
+    # Precompute transitive ancestor closure for each node using DFS/BFS
+    ancestor_closure = [set() for _ in range(n)]
+    for i in range(n):
+        # BFS/DFS from i to collect all ancestors
+        stack = list(preds.get(i, []))
+        seen = set(stack)
+        while stack:
+            cur = stack.pop()
+            ancestor_closure[i].add(cur)
+            for p in preds.get(cur, []):
+                if p not in seen:
+                    seen.add(p)
+                    stack.append(p)
+
+    # closure for variable i is ancestors + i
+    closures = [set(ancestor_closure[i]) | {i} for i in range(n)]
+
+    # Feasibility check of adding closure (closure is set of vars to ensure present),
+    # given currently selected_set.
+    def feasible_closure(closure, selected_set):
+        # New items that would be added
+        new_items = closure - selected_set
+        # Cardinality check
+        if len(selected_set) + len(new_items) > max_card:
+            return False
+        # Mutex check: none of new items conflict with each other or with selected
+        for v in new_items:
+            # conflicts with selected
+            if any(conflict in selected_set for conflict in mutex_map.get(v, ())) :
+                return False
+            # conflicts with other new items
+            for conflict in mutex_map.get(v, ()):
+                if conflict in new_items:
+                    return False
+        # Group check: cannot create group count >1
+        group_counts = {}
+        for v in selected_set:
+            g = var_to_group.get(v)
+            if g is not None:
+                group_counts[g] = group_counts.get(g, 0) + 1
+        for v in new_items:
+            g = var_to_group.get(v)
+            if g is not None:
+                group_counts[g] = group_counts.get(g, 0) + 1
+                if group_counts[g] > 1:
+                    return False
+        # Precedence: closures already contain transitive ancestors; but if closure lacks
+        # some ancestor (shouldn't) ensure those ancestors are in selected_set
+        for v in closure:
+            for a in preds.get(v, ()):
+                if a not in closure and a not in selected_set:
+                    return False
+        return True
+
+    # Compute marginal gain for adding closure (new items = closure - selected_set)
+    def marginal_gain(closure, selected_set):
+        new_items = closure - selected_set
+        if not new_items:
+            return 0.0
+        gain = 0.0
+        # weights
+        for i in new_items:
+            if 0 <= i < len(weights):
+                try:
+                    gain += float(weights[i])
+                except Exception:
+                    pass
+        # interactions among new items
+        # iterate edges from each new item to higher-index new items to avoid double count
+        new_list = list(new_items)
+        l = len(new_list)
+        for idx in range(l):
+            u = new_list[idx]
+            # interactions with other new items
+            for v in new_list[idx+1:]:
+                gain += interactions.get(u, {}).get(v, 0.0)
+        # interactions between new items and already selected
+        for u in new_items:
+            for v in selected_set:
+                gain += interactions.get(u, {}).get(v, 0.0)
+        return gain
+
+    # Greedy selection: add closure with best marginal gain while respecting constraints
+    selected_set = set()
+    # Initial heuristic: consider items sorted by weight+abs(interaction_potential)
+    # but main loop will evaluate closures anyway, so we iterate all candidates
+    improved = True
+    while len(selected_set) < max_card and improved:
+        improved = False
+        best_gain = float("-inf")
+        best_closure = None
+        # Evaluate every candidate not yet in selected_set
+        for i in range(n):
+            if i in selected_set:
+                continue
+            closure = closures[i]
+            if not feasible_closure(closure, selected_set):
+                continue
+            gain = marginal_gain(closure, selected_set)
+            # Tie-breaker: prefer larger closure (helps reach min_card)
+            if (gain > best_gain) or (abs(gain - best_gain) < 1e-12 and best_closure is not None and len(closure - selected_set) > len(best_closure - selected_set)) or (best_closure is None and gain >= best_gain):
+                best_gain = gain
+                best_closure = closure
+        # Accept non-negative gain closures; small negative may be accepted later to meet min_card
+        if best_closure is not None and best_gain > -1e-12:
+            new_items = best_closure - selected_set
+            if new_items:
+                selected_set.update(new_items)
+                improved = True
+        else:
+            break
+
+    # If we haven't met min_card, add best feasible closures even if negative
+    while len(selected_set) < min_card:
+        best_gain = float("-inf")
+        best_closure = None
+        for i in range(n):
+            if i in selected_set:
+                continue
+            closure = closures[i]
+            if not feasible_closure(closure, selected_set):
+                continue
+            gain = marginal_gain(closure, selected_set)
+            if (gain > best_gain) or (abs(gain - best_gain) < 1e-12 and best_closure is not None and len(closure - selected_set) > len(best_closure - selected_set)) or (best_closure is None and gain >= best_gain):
+                best_gain = gain
+                best_closure = closure
+        if best_closure is None:
+            # no feasible closures left
+            break
+        selected_set.update(best_closure - selected_set)
+
+    # Safety trim if we're over max_card (should rarely happen due to checks)
+    if len(selected_set) > max_card:
+        # compute approximate item score = weight + sum interactions with others in selected_set
+        def item_score(i):
+            s = 0.0
+            if 0 <= i < len(weights):
+                try:
+                    s += float(weights[i])
+                except Exception:
+                    pass
+            for j in selected_set:
+                if j == i:
+                    continue
+                s += interactions.get(i, {}).get(j, 0.0)
+            return s
+        sorted_items = sorted(selected_set, key=lambda x: item_score(x), reverse=True)
+        selected_set = set(sorted_items[:max_card])
+
+    result = {"selection": {"variables": sorted(int(x) for x in selected_set)}}
+    print(json.dumps(result))
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_sds(problem_data=None):
+    """
+    Main function called by the evaluator.
+    Can accept problem_data as parameter or read from stdin.
+    Returns JSON string (for ShinkaEvolve) or prints to stdout (for direct execution).
+    """
+    import sys
+    import json
+    import io
+
+    if problem_data is None:
+        # Read from stdin (for compatibility)
+        input_data = json.load(sys.stdin)
+    else:
+        # Use provided problem data
+        input_data = problem_data
+
+    # Capture stdout from solve_sds
+    stdout_capture = io.StringIO()
+    old_stdin = sys.stdin
+
+    try:
+        # Create mock stdin
+        sys.stdin = io.StringIO(json.dumps(input_data))
+        with contextlib.redirect_stdout(stdout_capture):
+            solve_sds()
+    finally:
+        sys.stdin = old_stdin
+
+    result_str = stdout_capture.getvalue()
+    return result_str

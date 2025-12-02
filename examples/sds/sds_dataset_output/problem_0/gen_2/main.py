@@ -1,0 +1,340 @@
+"""
+Initial solution for Synergistic Dependency Selection (SDS) problem.
+The code in EVOLVE-BLOCK will be evolved by ShinkaEvolve.
+"""
+
+import json
+import sys
+import contextlib
+
+# EVOLVE-BLOCK-START
+def solve_sds():
+    """
+    Solve the Synergistic Dependency Selection problem.
+
+    Reads from stdin: JSON with "requirements" and "catalog"
+    Outputs to stdout: JSON with "selection" containing "variables" list
+
+    Improved greedy + local search:
+    - Evaluate true marginal gains including interactions.
+    - Respect precedence by adding predecessor closures when needed.
+    - Enforce mutex and group constraints when considering additions.
+    - Perform simple 1-for-1 local-search swaps to improve objective.
+    """
+    # Read input
+    input_data = json.load(sys.stdin)
+    requirements = input_data.get("requirements", {})
+    catalog = input_data.get("catalog", {})
+
+    # Extract constraints
+    weights = requirements.get("weights", [])
+    interactions = requirements.get("interactions", {})
+    cardinality_bounds = requirements.get("cardinality_bounds", [0, len(weights)])
+    min_card, max_card = cardinality_bounds[0], cardinality_bounds[1]
+    mutex = requirements.get("mutex", [])
+    groups = requirements.get("groups", {})
+    precedence = requirements.get("precedence", [])
+
+    n = len(weights)
+
+    # Build interaction lookup function supporting both "i,j" keys and nested dicts
+    interaction_map = {}
+    # If interactions given as dict with string keys like "i,j"
+    for k, v in interactions.items():
+        if isinstance(k, str):
+            try:
+                i_s, j_s = k.split(",")
+                i, j = int(i_s), int(j_s)
+                if i > j:
+                    i, j = j, i
+                interaction_map[(i, j)] = float(v)
+            except Exception:
+                # fallback: ignore malformed keys
+                pass
+        elif isinstance(k, (list, tuple)) and len(k) == 2:
+            try:
+                i, j = int(k[0]), int(k[1])
+                if i > j:
+                    i, j = j, i
+                interaction_map[(i, j)] = float(v)
+            except Exception:
+                pass
+        else:
+            # maybe nested mapping interactions[i][j]
+            try:
+                # will handle below
+                pass
+            except Exception:
+                pass
+    # handle nested dict case: interactions may be like {i: {j: val}}
+    if not interaction_map:
+        try:
+            for i_key, row in interactions.items():
+                ii = int(i_key)
+                for j_key, v in row.items():
+                    jj = int(j_key)
+                    a, b = (ii, jj) if ii <= jj else (jj, ii)
+                    interaction_map[(a, b)] = float(v)
+        except Exception:
+            # If parsing fails, leave interaction_map empty
+            pass
+
+    def get_interaction(i, j):
+        a, b = (i, j) if i <= j else (j, i)
+        return interaction_map.get((a, b), 0.0)
+
+    # Build predecessor map for precedence constraints
+    preds = {i: set() for i in range(n)}
+    for p in precedence:
+        try:
+            pi, pj = int(p[0]), int(p[1])
+            # if pj selected then pi must be selected
+            preds[pj].add(pi)
+        except Exception:
+            pass
+    # compute transitive closure of predecessors for each node
+    pred_closure = {}
+    for i in range(n):
+        stack = list(preds.get(i, []))
+        closure = set()
+        while stack:
+            x = stack.pop()
+            if x in closure:
+                continue
+            closure.add(x)
+            for pp in preds.get(x, []):
+                if pp not in closure:
+                    stack.append(pp)
+        pred_closure[i] = closure
+
+    # Helper: check feasibility of a full candidate set S (set of indices)
+    def is_feasible_set(S):
+        # cardinality
+        if len(S) > max_card or len(S) < 0:
+            return False
+        # mutex: no pair both present
+        for a, b in mutex:
+            if a in S and b in S:
+                return False
+        # groups: at most one per group
+        for grp_vars in groups.values():
+            if len(set(grp_vars).intersection(S)) > 1:
+                return False
+        # precedence: for every j in S, all its preds must be in S
+        for j in list(S):
+            if not pred_closure.get(j):
+                # OK
+                pass
+            # direct preds
+            for pi in preds.get(j, set()):
+                if pi not in S:
+                    return False
+        return True
+
+    # Objective calculation
+    def objective(S):
+        S_list = list(S)
+        total = 0.0
+        for i in S_list:
+            total += weights[i] if i < len(weights) else 0.0
+        # pairwise interactions (count each pair once)
+        for idx in range(len(S_list)):
+            for jdx in range(idx+1, len(S_list)):
+                total += get_interaction(S_list[idx], S_list[jdx])
+        return total
+
+    # Function to compute marginal gain of adding set A (iterable) to current set S
+    def marginal_gain(S, A):
+        A = set(A) - set(S)
+        if not A:
+            return 0.0
+        gain = 0.0
+        for i in A:
+            gain += weights[i] if i < len(weights) else 0.0
+        # interactions between A and S
+        for i in A:
+            for j in S:
+                gain += get_interaction(i, j)
+        # interactions internal to A
+        A_list = list(A)
+        for ii in range(len(A_list)):
+            for jj in range(ii+1, len(A_list)):
+                gain += get_interaction(A_list[ii], A_list[jj])
+        return gain
+
+    # Helper: when trying to add item i, compute required closure (predecessors)
+    def closure_for(i, current_set):
+        # items that must be present if we include i: i plus all transitive predecessors
+        C = set([i])
+        for p in pred_closure.get(i, set()):
+            C.add(p)
+        # Some predecessors may themselves have predecessors already included by pred_closure
+        # pred_closure already transitive, so this suffices.
+        # Remove those already in current_set
+        return C - set(current_set)
+
+    # Main greedy: iteratively add the candidate (plus its preds) with best marginal gain
+    selected_set = set()
+    # We'll allow adding until no improvement or until max_card reached.
+    while len(selected_set) < max_card:
+        best_gain = None
+        best_add = None
+        # evaluate every candidate not in selected_set
+        for i in range(n):
+            if i in selected_set:
+                continue
+            # compute closure needed
+            add_set = closure_for(i, selected_set)
+            # if adding would exceed max_card, skip
+            if len(selected_set) + len(add_set) > max_card:
+                continue
+            # Check feasibility when adding
+            new_set = set(selected_set) | set(add_set)
+            if not is_feasible_set(new_set):
+                continue
+            gain = marginal_gain(selected_set, add_set)
+            if best_gain is None or gain > best_gain:
+                best_gain = gain
+                best_add = add_set
+        # Stop if nothing feasible to add
+        if best_add is None:
+            break
+        # If best_gain is negative and we've already reached min_card, stop adding further
+        if best_gain is not None and best_gain < 0 and len(selected_set) >= min_card:
+            break
+        # Otherwise add the best_add
+        selected_set |= set(best_add)
+
+    # If we haven't reached minimum cardinality, force-add best remaining items (respecting constraints)
+    if len(selected_set) < min_card:
+        # consider candidates by marginal gain ignoring negative cutoff
+        candidates = [i for i in range(n) if i not in selected_set]
+        # sort by simple heuristic gain (weight + sum positive interactions)
+        def heuristic_gain(i):
+            g = weights[i] if i < len(weights) else 0.0
+            for j in range(n):
+                if j == i:
+                    continue
+                g += abs(get_interaction(i, j)) * 0.2
+            return g
+        candidates.sort(key=heuristic_gain, reverse=True)
+        for i in candidates:
+            if len(selected_set) >= min_card:
+                break
+            add_set = closure_for(i, selected_set)
+            if len(selected_set) + len(add_set) > max_card:
+                continue
+            new_set = set(selected_set) | set(add_set)
+            if not is_feasible_set(new_set):
+                continue
+            selected_set |= set(add_set)
+
+    # Local search: try single-item swaps to improve objective (remove one, add one or add closure)
+    improved = True
+    max_iters = 500
+    it = 0
+    current_obj = objective(selected_set)
+    # Precompute all items list
+    all_items = set(range(n))
+    while improved and it < max_iters:
+        improved = False
+        it += 1
+        # iterate possible removals and additions
+        removed_item = None
+        added_items = None
+        best_obj = current_obj
+        for rem in list(selected_set):
+            # Try remove rem and try to add any outside item (with its closure w.r.t resulting set)
+            base_set = set(selected_set)
+            base_set.remove(rem)
+            # Ensure base_set is still feasible (removing may break precedence if rem was a predecessor of others)
+            if not is_feasible_set(base_set):
+                # Can't remove this item unless we also remove dependents; skip for simplicity
+                continue
+            for add in (all_items - base_set):
+                if add in base_set:
+                    continue
+                add_closure = closure_for(add, base_set)
+                candidate_set = set(base_set) | set(add_closure)
+                # respect cardinality
+                if len(candidate_set) < min_card or len(candidate_set) > max_card:
+                    continue
+                if not is_feasible_set(candidate_set):
+                    continue
+                obj = objective(candidate_set)
+                if obj > best_obj + 1e-9:
+                    best_obj = obj
+                    removed_item = rem
+                    added_items = set(add_closure)
+        if best_obj > current_obj + 1e-9 and removed_item is not None:
+            # apply improvement
+            selected_set.remove(removed_item)
+            selected_set |= set(added_items)
+            current_obj = best_obj
+            improved = True
+
+    # Final safety: ensure feasibility (if not, fall back to greedy selection by weight)
+    if not is_feasible_set(selected_set):
+        selected_set = set()
+        for i in sorted(range(n), key=lambda x: weights[x], reverse=True):
+            if len(selected_set) >= max_card:
+                break
+            add_set = closure_for(i, selected_set)
+            if len(selected_set) + len(add_set) > max_card:
+                continue
+            new_set = set(selected_set) | set(add_set)
+            if not is_feasible_set(new_set):
+                continue
+            selected_set |= set(add_set)
+        # fill up if still below min_card
+        i = 0
+        while len(selected_set) < min_card and i < n:
+            if i not in selected_set:
+                add_set = closure_for(i, selected_set)
+                if len(selected_set) + len(add_set) <= max_card:
+                    new_set = set(selected_set) | set(add_set)
+                    if is_feasible_set(new_set):
+                        selected_set |= set(add_set)
+            i += 1
+
+    result = {
+        "selection": {
+            "variables": sorted(list(selected_set))
+        }
+    }
+    print(json.dumps(result))
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_sds(problem_data=None):
+    """
+    Main function called by the evaluator.
+    Can accept problem_data as parameter or read from stdin.
+    Returns JSON string (for ShinkaEvolve) or prints to stdout (for direct execution).
+    """
+    import sys
+    import json
+    import io
+
+    if problem_data is None:
+        # Read from stdin (for compatibility)
+        input_data = json.load(sys.stdin)
+    else:
+        # Use provided problem data
+        input_data = problem_data
+
+    # Capture stdout from solve_sds
+    stdout_capture = io.StringIO()
+    old_stdin = sys.stdin
+
+    try:
+        # Create mock stdin
+        sys.stdin = io.StringIO(json.dumps(input_data))
+        with contextlib.redirect_stdout(stdout_capture):
+            solve_sds()
+    finally:
+        sys.stdin = old_stdin
+
+    result_str = stdout_capture.getvalue()
+    return result_str
