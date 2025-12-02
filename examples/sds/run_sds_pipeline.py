@@ -15,6 +15,7 @@ import argparse
 import tqdm
 import sys
 import random
+import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
 from datasets import Dataset
@@ -141,12 +142,28 @@ def main():
         "--output_dir", type=str, default="sds_dataset_output",
         help="Output directory for results"
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Master seed for reproducibility. Seeds problem generation deterministically. "
+             "Evolution uses natural randomness to ensure diversity and avoid mode collapse."
+    )
     args = parser.parse_args()
     
     load_dotenv()
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OpenAI API Key required for SFT Data Generation")
+    
+    # Set up seeding for reproducibility
+    # Strategy: Seed problem generation deterministically, but let evolution
+    # use natural randomness to avoid mode collapse while maintaining problem reproducibility
+    master_seed = args.seed
+    if master_seed is not None:
+        # Seed Python's random for problem generation
+        random.seed(master_seed)
+        print(f"🌱 Using master seed: {master_seed} (problem generation seeded, evolution uses natural randomness)")
+    else:
+        print("⚠️  No seed provided - results will not be reproducible")
     
     # Initialize trace generator
     tracer = TraceGenerator(api_key=api_key, model="gpt-4o")
@@ -162,12 +179,19 @@ def main():
     
     # Loop through desired samples
     for i in tqdm.tqdm(range(args.samples), desc="Generating samples"):
-        # A. Generate a Problem Instance
+        # Seed problem generation deterministically (reproducible problems)
+        if master_seed is not None:
+            problem_seed = master_seed + i
+            random.seed(problem_seed)  # Seed for this problem's generation
+        
+        # A. Generate a Problem Instance (deterministic when seed is set)
         ptype = "dense" if i % 2 == 0 else "tree"
+        n_size = random.randint(15, 25)  # Deterministic when seed is set
+        problem_gen_seed = problem_seed if master_seed is not None else i
         if ptype == "dense":
-            inst = make_dense_instance(n=random.randint(15, 25), seed=i)
+            inst = make_dense_instance(n=n_size, seed=problem_gen_seed)
         else:
-            inst = make_tree_instance(n=random.randint(15, 25), seed=i)
+            inst = make_tree_instance(n=n_size, seed=problem_gen_seed)
         
         problem_dict = _instance_to_problem(inst, ptype, i)
         prompt_data = sds_render_prompt(problem_dict)
@@ -195,6 +219,8 @@ def main():
         )
         
         # C. Run Shinka Evolution
+        # Note: Evolution uses natural randomness to explore diverse solutions
+        # and avoid mode collapse. Problem generation is seeded for reproducibility.
         print(f"\n🔬 Running evolution for problem {i} ({ptype})...")
         evo_runner = EvolutionRunner(
             evo_config=evo_config,
