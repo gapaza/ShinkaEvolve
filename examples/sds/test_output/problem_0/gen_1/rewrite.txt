@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""
+Evolved solution for Synergistic Dependency Selection (SDS) problem.
+"""
+
+import json
+import sys
+import contextlib
+from collections import defaultdict, deque
+
+# EVOLVE-BLOCK-START
+def solve_sds():
+    """
+    Improved SDS solver:
+    - Reads JSON from stdin with "requirements" and "catalog"
+    - Writes JSON to stdout with "selection": {"variables": [...]}
+    """
+    data = json.load(sys.stdin)
+    requirements = data.get("requirements", {})
+    catalog = data.get("catalog", {})
+
+    weights = requirements.get("weights", [])
+    n = len(weights)
+    interactions_raw = requirements.get("interactions", {})
+    cardinality_bounds = requirements.get("cardinality_bounds", [0, n])
+    if cardinality_bounds is None:
+        cardinality_bounds = [0, n]
+    min_card, max_card = max(0, int(cardinality_bounds[0])), int(cardinality_bounds[1])
+
+    mutex_pairs = requirements.get("mutex", []) or []
+    groups = requirements.get("groups", {}) or {}
+    precedence_pairs = requirements.get("precedence", []) or []
+
+    # Normalize and preprocess interactions: map (i,j) -> value, symmetric
+    interactions = {}
+    for k, v in interactions_raw.items():
+        try:
+            if isinstance(k, str):
+                parts = [p.strip() for p in k.split(",")]
+                if len(parts) >= 2:
+                    i = int(parts[0])
+                    j = int(parts[1])
+                else:
+                    continue
+            elif isinstance(k, (list, tuple)) and len(k) >= 2:
+                i, j = int(k[0]), int(k[1])
+            else:
+                continue
+            if 0 <= i < n and 0 <= j < n:
+                interactions[(i, j)] = float(v)
+                interactions[(j, i)] = float(v)
+        except Exception:
+            # Skip malformed keys
+            continue
+
+    # Normalize mutex pairs as tuples of ints
+    mutex = set()
+    for p in mutex_pairs:
+        try:
+            a, b = int(p[0]), int(p[1]) if isinstance(p, (list, tuple)) else int(p.split(",")[1])
+            if 0 <= a < n and 0 <= b < n:
+                mutex.add((a, b))
+                mutex.add((b, a))
+        except Exception:
+            # try alternative parsing
+            try:
+                if isinstance(p, str):
+                    a_s, b_s = [x.strip() for x in p.split(",")]
+                    a, b = int(a_s), int(b_s)
+                    if 0 <= a < n and 0 <= b < n:
+                        mutex.add((a, b)); mutex.add((b, a))
+            except Exception:
+                continue
+
+    # Group mapping: group_id -> set(vars); also var -> group_id (assume at most one group membership for variable)
+    group_of = {}
+    group_sets = {}
+    for gid, lst in groups.items():
+        try:
+            vars_list = [int(x) for x in lst]
+        except Exception:
+            # try parsing if they are strings with commas
+            vars_list = []
+            for item in lst:
+                try:
+                    vars_list.append(int(item))
+                except Exception:
+                    pass
+        gset = set(v for v in vars_list if 0 <= v < n)
+        group_sets[gid] = gset
+        for v in gset:
+            # if a variable appears in multiple groups, we keep the first encountered group only
+            if v not in group_of:
+                group_of[v] = gid
+
+    # Precedence: Build adjacency where if (i,j) then i is required if j selected.
+    # We'll compute transitive prerequisites for each node.
+    prereq_adj = defaultdict(set)  # j -> set of direct prerequisites i
+    depend_adj = defaultdict(set)  # i -> set of direct dependents j
+    for p in precedence_pairs:
+        try:
+            i, j = int(p[0]), int(p[1]) if isinstance(p, (list, tuple)) else (int(p.split(",")[0]), int(p.split(",")[1]))
+        except Exception:
+            try:
+                # p may be a list-like [i,j]
+                i, j = int(p[0]), int(p[1])
+            except Exception:
+                continue
+        if 0 <= i < n and 0 <= j < n:
+            prereq_adj[j].add(i)
+            depend_adj[i].add(j)
+
+    # Compute transitive closure of prerequisites for each node using DFS/BFS
+    trans_prereq = [set() for _ in range(n)]
+    for v in range(n):
+        seen = set()
+        stack = list(prereq_adj.get(v, []))
+        while stack:
+            u = stack.pop()
+            if u in seen:
+                continue
+            seen.add(u)
+            for w in prereq_adj.get(u, []):
+                if w not in seen:
+                    stack.append(w)
+        trans_prereq[v] = seen
+
+    # Helper: compute closure of a set of variables: include all prerequisites transitively
+    def closure_of(vars_iterable):
+        closure = set()
+        stack = list(vars_iterable)
+        while stack:
+            x = stack.pop()
+            if x in closure:
+                continue
+            closure.add(x)
+            for p in trans_prereq[x]:
+                if p not in closure:
+                    stack.append(p)
+        return closure
+
+    # Helper: compute objective for a set of variables (sum weights + pairwise interactions)
+    def compute_score(var_set):
+        s = 0.0
+        for v in var_set:
+            s += weights[v]
+        # sum interactions for unordered pairs; to avoid double counting use i<j
+        # interactions dict is symmetric, but we can iterate pairs
+        vs = sorted(var_set)
+        L = len(vs)
+        for i_idx in range(L):
+            i = vs[i_idx]
+            for j_idx in range(i_idx + 1, L):
+                j = vs[j_idx]
+                val = interactions.get((i, j), 0.0)
+                s += val
+        return s
+
+    # Feasibility checks for adding candidate closure to current selection
+    def feasible_union(sel_set, add_set):
+        # union size check
+        union_set = sel_set.union(add_set)
+        if len(union_set) > max_card:
+            return False
+        # group constraints: at most one per group
+        # For each group, ensure that number of variables from union_set <=1
+        # Use group_of mapping for speed
+        occupied = {}
+        for v in union_set:
+            gid = group_of.get(v)
+            if gid is None:
+                continue
+            if gid in occupied:
+                # another var already present in this group
+                return False
+            occupied[gid] = v
+        # mutex constraints
+        # For each var in add_set, ensure it doesn't conflict with any already in sel_set
+        for a in add_set:
+            for b in sel_set:
+                if (a, b) in mutex:
+                    return False
+        # Also ensure no mutex within add_set
+        add_list = list(add_set)
+        for i_idx in range(len(add_list)):
+            a = add_list[i_idx]
+            for j_idx in range(i_idx + 1, len(add_list)):
+                b = add_list[j_idx]
+                if (a, b) in mutex:
+                    return False
+        # Precedence: add_set should already be closed (we will ensure), and sel_set may have nodes that require items not in union:
+        # But since sel_set is assumed previously feasible, only need to ensure that union doesn't violate precedence (it won't).
+        return True
+
+    # Start greedy selection
+    selected = set()
+
+    # We'll iteratively pick a candidate that maximizes marginal_gain / added_count
+    # Precompute base interaction sums for speed when evaluating candidate closure
+    # But given small n typical and simplicity, compute marginal gain on the fly.
+
+    # Candidate set is {0..n-1} \ selected
+    # Greedy loop
+    while True:
+        best_candidate = None
+        best_score_ratio = -float("inf")
+        best_gain = -float("inf")
+        best_addset = None
+
+        for v in range(n):
+            if v in selected:
+                continue
+            # candidate requires closure
+            cand_closure = closure_of([v])
+            add_set = cand_closure - selected
+            if not add_set:
+                # nothing new would be added (all prerequisites already present and v already selected? if v already selected we skip)
+                # If v itself already present then continue; otherwise must include v but maybe transitive closure included v? handle:
+                if v in selected:
+                    continue
+            # feasibility check
+            if not feasible_union(selected, add_set):
+                continue
+            # compute marginal gain
+            # sum weights of add_set
+            gain = sum(weights[x] for x in add_set)
+            # interactions between add_set and selected
+            for a in add_set:
+                for b in selected:
+                    gain += interactions.get((a, b), 0.0)
+            # interactions internal to add_set (unordered)
+            add_list = sorted(add_set)
+            for i_idx in range(len(add_list)):
+                for j_idx in range(i_idx + 1, len(add_list)):
+                    a = add_list[i_idx]; b = add_list[j_idx]
+                    gain += interactions.get((a, b), 0.0)
+            added = len(add_set)
+            if added == 0:
+                continue
+            # Use gain per added item as primary ranking, tie-break by absolute gain
+            ratio = gain / added
+            if ratio > best_score_ratio or (abs(ratio - best_score_ratio) <= 1e-9 and gain > best_gain):
+                best_score_ratio = ratio
+                best_candidate = v
+                best_gain = gain
+                best_addset = add_set
+
+        if best_candidate is None:
+            break
+        # If best_gain is negative and we already satisfy min_card, stop
+        if best_gain <= 0 and len(selected) >= min_card:
+            break
+        # Otherwise add best_addset (even if negative but needed to reach min_card)
+        if feasible_union(selected, best_addset):
+            selected |= best_addset
+        else:
+            # can't add, break to avoid infinite loop
+            break
+        # Stop if reach max
+        if len(selected) >= max_card:
+            break
+
+    # If below minimum cardinality, force-add best feasible nodes (smallest penalty)
+    if len(selected) < min_card:
+        # compute for each candidate not selected the marginal gain (may be negative) and cost added
+        candidates = []
+        for v in range(n):
+            if v in selected:
+                continue
+            add_set = closure_of([v]) - selected
+            if not add_set:
+                continue
+            if not feasible_union(selected, add_set):
+                continue
+            # compute gain as above
+            gain = sum(weights[x] for x in add_set)
+            for a in add_set:
+                for b in selected:
+                    gain += interactions.get((a, b), 0.0)
+            add_list = sorted(add_set)
+            for i_idx in range(len(add_list)):
+                for j_idx in range(i_idx + 1, len(add_list)):
+                    a = add_list[i_idx]; b = add_list[j_idx]
+                    gain += interactions.get((a, b), 0.0)
+            candidates.append((gain / len(add_set), gain, add_set))
+        # Sort by best ratio then gain
+        candidates.sort(key=lambda x: ( -x[0], -x[1] ))
+        idx = 0
+        # Add until reach min_card or no candidate
+        while len(selected) < min_card and idx < len(candidates):
+            add_set = candidates[idx][2]
+            if feasible_union(selected, add_set):
+                selected |= add_set
+            idx += 1
+        # If still below min_card, add any remaining feasible singletons ignoring gain
+        if len(selected) < min_card:
+            for v in range(n):
+                if len(selected) >= min_card:
+                    break
+                if v in selected:
+                    continue
+                add_set = closure_of([v]) - selected
+                if not add_set:
+                    continue
+                if feasible_union(selected, add_set):
+                    selected |= add_set
+
+    # Local improvement: try single additions, single removals (only removable if not required by other selected), and single swaps
+    current_score = compute_score(selected)
+    improved = True
+    iter_limit = 200
+    it = 0
+    while improved and it < iter_limit:
+        improved = False
+        it += 1
+        # Try adding a single candidate closure that improves score
+        best_delta = 0.0
+        best_action = None  # ("add", add_set) or ("remove", rem) or ("swap", (rem_set, add_set))
+        for v in range(n):
+            if v in selected:
+                continue
+            add_set = closure_of([v]) - selected
+            if not add_set:
+                continue
+            if not feasible_union(selected, add_set):
+                continue
+            new_score = compute_score(selected.union(add_set))
+            delta = new_score - current_score
+            if delta > best_delta + 1e-9:
+                best_delta = delta
+                best_action = ("add", add_set)
+        # Try removals: only remove variables that are not prerequisites for any remaining selected variable
+        # So a variable r is removable if none of its dependents are in selected (transitively)
+        # We can check direct dependents and their transitive closure: since we have trans_prereq, we can check if any selected node requires r
+        removable = []
+        for r in list(selected):
+            # if any selected node (other than r) has r in its trans_prereq, r is required
+            required = False
+            for s in selected:
+                if s == r:
+                    continue
+                if r in trans_prereq[s]:
+                    required = True
+                    break
+            if not required:
+                removable.append(r)
+        for r in removable:
+            new_selected = set(selected)
+            new_selected.remove(r)
+            # removing r might allow other nodes to become infeasible wrt precedence? We ensure only removable ones
+            if len(new_selected) < min_card:
+                continue  # do not remove below minimum
+            new_score = compute_score(new_selected)
+            delta = new_score - current_score
+            if delta > best_delta + 1e-9:
+                best_delta = delta
+                best_action = ("remove", r)
+        # Try single swaps: remove one removable r and add candidate add_set such that net gain positive
+        if not best_action:
+            # consider swaps
+            for r in removable:
+                temp_selected = set(selected)
+                temp_selected.remove(r)
+                # examine adds that are feasible with temp_selected
+                for v in range(n):
+                    if v in temp_selected:
+                        continue
+                    add_set = closure_of([v]) - temp_selected
+                    if not add_set:
+                        continue
+                    if not feasible_union(temp_selected, add_set):
+                        continue
+                    if len(temp_selected.union(add_set)) > max_card:
+                        continue
+                    new_score = compute_score(temp_selected.union(add_set))
+                    delta = new_score - current_score
+                    if delta > best_delta + 1e-9:
+                        best_delta = delta
+                        best_action = ("swap", (r, add_set))
+        # Apply best action if it yields improvement
+        if best_action and best_delta > 1e-9:
+            improved = True
+            typ = best_action[0]
+            if typ == "add":
+                selected |= best_action[1]
+            elif typ == "remove":
+                selected.remove(best_action[1])
+            elif typ == "swap":
+                r, add_set = best_action[1]
+                if r in selected:
+                    selected.remove(r)
+                selected |= add_set
+            current_score = compute_score(selected)
+        else:
+            # no improving action found
+            break
+
+    # Final safety trims: if selection exceeds max_card (shouldn't), remove lowest marginal contributors
+    if len(selected) > max_card:
+        # compute marginal contribution of each removable var (cannot remove required ones)
+        removable = []
+        for r in list(selected):
+            # check if removable (no selected depends on r)
+            required = False
+            for s in selected:
+                if s == r:
+                    continue
+                if r in trans_prereq[s]:
+                    required = True; break
+            if not required:
+                removable.append(r)
+        # sort removable by (weight + interactions with others) ascending (smallest contribution removed first)
+        contribs = []
+        for r in removable:
+            contrib = weights[r]
+            for o in selected:
+                if o == r:
+                    continue
+                contrib += interactions.get((r, o), 0.0)
+            contribs.append((contrib, r))
+        contribs.sort()  # ascending
+        idx = 0
+        while len(selected) > max_card and idx < len(contribs):
+            selected.remove(contribs[idx][1])
+            idx += 1
+
+    final_selection = sorted(int(x) for x in selected)
+    # Guarantee feasibility one last time: if still below min_card, pad with feasible singletons (ignore objective)
+    idx = 0
+    while len(final_selection) < min_card and idx < n:
+        if idx not in final_selection:
+            trial_add = closure_of([idx])
+            # only add those within bounds and feasible
+            if len(set(final_selection).union(trial_add)) <= max_card:
+                # check groups and mutex quickly
+                ok = True
+                # groups
+                for v in trial_add:
+                    gid = group_of.get(v)
+                    if gid is not None:
+                        for u in final_selection:
+                            if group_of.get(u) == gid:
+                                ok = False; break
+                    if not ok:
+                        break
+                # mutex
+                if ok:
+                    for a in trial_add:
+                        for b in final_selection:
+                            if (a, b) in mutex:
+                                ok = False; break
+                        if not ok:
+                            break
+                if ok:
+                    final_selection = sorted(set(final_selection).union(trial_add))
+        idx += 1
+
+    result = {"selection": {"variables": final_selection}}
+    print(json.dumps(result))
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_sds(problem_data=None):
+    """
+    Main function called by the evaluator.
+    Can accept problem_data as parameter or read from stdin.
+    Returns JSON string (for ShinkaEvolve) or prints to stdout (for direct execution).
+    """
+    import sys
+    import json
+    import io
+    
+    if problem_data is None:
+        # Read from stdin (for compatibility)
+        input_data = json.load(sys.stdin)
+    else:
+        # Use provided problem data
+        input_data = problem_data
+    
+    # Capture stdout from solve_sds
+    stdout_capture = io.StringIO()
+    old_stdin = sys.stdin
+    
+    try:
+        # Create mock stdin
+        sys.stdin = io.StringIO(json.dumps(input_data))
+        with contextlib.redirect_stdout(stdout_capture):
+            solve_sds()
+    finally:
+        sys.stdin = old_stdin
+    
+    result_str = stdout_capture.getvalue()
+    return result_str
+
+
+if __name__ == "__main__":
+    solve_sds()

@@ -187,7 +187,8 @@ def main():
             results_dir=str(problem_results_dir),
         )
         db_config = create_sds_database_config()
-        db_config.db_path = str(problem_results_dir / "evolution_db.sqlite")
+        # EvolutionRunner will prepend results_dir, so just use filename
+        db_config.db_path = "evolution_db.sqlite"
         
         job_config = LocalJobConfig(
             eval_program_path="evaluate.py"  # Relative to current directory
@@ -209,6 +210,7 @@ def main():
             continue
         
         # D. Extract best solution from database
+        # EvolutionRunner creates db at results_dir/db_path
         db_path = str(problem_results_dir / "evolution_db.sqlite")
         best_code, best_fitness = extract_best_code_from_database(db_path)
         
