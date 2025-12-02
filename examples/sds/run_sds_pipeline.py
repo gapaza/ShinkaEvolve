@@ -131,8 +131,10 @@ def main():
         help="Evolution generations per problem"
     )
     parser.add_argument(
-        "--push_to", type=str,
-        help="HuggingFace repo ID (e.g., 'Org/Dataset')"
+        "--push_to", type=str, default=None,
+        help="HuggingFace repo ID (e.g., 'Org/Dataset'). If not provided, will auto-generate "
+             "names based on sample count and seed: SoheylM/ShinkaEvolve-SDS-{N}k-seed{seed} and "
+             "IDEALLab/ShinkaEvolve-SDS-{N}k-seed{seed}"
     )
     parser.add_argument(
         "--api_key", type=str,
@@ -153,6 +155,9 @@ def main():
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OpenAI API Key required for SFT Data Generation")
+    
+    # Check for HF_TOKEN if pushing to HuggingFace
+    hf_token = os.environ.get("HF_TOKEN")
     
     # Set up seeding for reproducibility
     # Strategy: Seed problem generation deterministically, but let evolution
@@ -270,23 +275,65 @@ def main():
     print(f"\n✅ Generated {len(dataset_records)} high-quality samples.")
     
     # G. Save or Push Dataset
-    if args.push_to and len(dataset_records) > 0:
-        print(f"📤 Pushing to HuggingFace: {args.push_to}...")
+    if len(dataset_records) > 0:
         ds = Dataset.from_list(dataset_records)
-        ds.push_to_hub(args.push_to, private=True)
-        print("✅ Done!")
-    else:
+        
+        # Determine repo names using same logic as push_sds_to_hf.py
+        if args.push_to:
+            # Use provided repo name
+            repos_to_push = [args.push_to]
+        else:
+            # Auto-generate repo names based on sample count and seed
+            total_samples = len(dataset_records)
+            # Format sample count for repo name (e.g., 10000 -> "10k", 5000 -> "5k")
+            if total_samples >= 1000:
+                sample_suffix = f"{total_samples // 1000}k"
+            else:
+                sample_suffix = str(total_samples)
+            
+            # Use seed from args if available, otherwise use master_seed
+            seed_value = args.seed if args.seed is not None else master_seed if master_seed is not None else 0
+            
+            # Create descriptive repo names for both organizations (matching push_sds_to_hf.py style)
+            soheylm_repo = f"SoheylM/ShinkaEvolve-SDS-{sample_suffix}-seed{seed_value}"
+            ideallab_repo = f"IDEALLab/ShinkaEvolve-SDS-{sample_suffix}-seed{seed_value}"
+            repos_to_push = [soheylm_repo, ideallab_repo]
+        
+        # Push to HuggingFace
+        if not hf_token:
+            print("⚠️  HF_TOKEN not found in environment. Cannot push to HuggingFace.")
+            print("   Saving dataset locally instead...")
+            repos_to_push = []  # Skip pushing
+        
+        success_count = 0
+        for repo_name in repos_to_push:
+            print(f"📤 Pushing to HuggingFace: {repo_name}...")
+            try:
+                ds.push_to_hub(repo_name, token=hf_token, private=True)
+                print(f"✅ Successfully pushed to {repo_name}")
+                success_count += 1
+            except Exception as e:
+                print(f"❌ Error pushing to {repo_name}: {e}")
+        
+        if success_count > 0:
+            print(f"✅ Successfully pushed to {success_count}/{len(repos_to_push)} repositories")
+        else:
+            print(f"❌ Failed to push to any repository")
+        
+        # Always save locally as backup
         output_file = output_dir / "sft_dataset.jsonl"
         with open(output_file, "w") as f:
             for r in dataset_records:
                 f.write(json.dumps(r) + "\n")
-        print(f"💾 Saved to {output_file}")
+        print(f"💾 Saved local backup to {output_file}")
         
         # Also save as JSON for easy inspection
         json_file = output_dir / "sft_dataset.json"
         with open(json_file, "w") as f:
             json.dump(dataset_records, f, indent=2)
         print(f"💾 Also saved to {json_file}")
+    else:
+        print("⚠️  No dataset records to save or push")
 
 
 if __name__ == "__main__":
