@@ -304,15 +304,29 @@ def process_single_problem(
             print(f"   ⚠️ Skipping {i}: No valid solution found (fitness: {best_fitness:.4f})")
             return None
         
-        # E. Generate Thinking Trace
+        # E. Extract only the EVOLVE-BLOCK content (remove markers and fixed code)
+        # The best_code from database contains the full file, but we only want the evolved part
+        from shinka.llm import extract_between
+        evolved_code = extract_between(best_code, "# EVOLVE-BLOCK-START", "# EVOLVE-BLOCK-END", False)
+        if not evolved_code or evolved_code == "none":
+            # Fallback: if extraction fails, use the full code (shouldn't happen)
+            evolved_code = best_code
+            print(f"   ⚠️ Warning: Could not extract EVOLVE-BLOCK content for problem {i}, using full code")
+        
+        # F. Generate Thinking Trace
         # Create trace generator per worker (thread-safe)
         tracer = TraceGenerator(api_key=api_key, model="gpt-5-mini")
-        trace = tracer.generate(prompt_data["problem"], best_code)
+        trace = tracer.generate(prompt_data["problem"], evolved_code)
         
-        # F. Format Entry for Student Training
+        # G. Filter out failed trace generations
+        if "Analysis failed." in trace or trace.strip() == "Analysis failed.":
+            print(f"   ⚠️ Skipping {i}: Trace generation failed")
+            return None
+        
+        # H. Format Entry for Student Training
         full_content = (
             f"<think>\n{trace}\n</think>\n\n"
-            f"<code>\n{best_code}\n</code>"
+            f"<code>\n{evolved_code}\n</code>"
         )
         
         # Calculate token counts
@@ -523,6 +537,19 @@ def main():
             ]
     
     print(f"\n✅ Generated {len(dataset_records)} high-quality samples out of {args.samples} attempted.")
+    
+    # Filter out any entries with failed traces (safety check)
+    filtered_records = []
+    for record in dataset_records:
+        assistant_content = record.get("messages", [{}])[1].get("content", "") if len(record.get("messages", [])) > 1 else ""
+        if "Analysis failed." in assistant_content:
+            print(f"⚠️  Filtering out problem {record.get('index', 'unknown')}: Contains 'Analysis failed.' in trace")
+            continue
+        filtered_records.append(record)
+    
+    if len(filtered_records) < len(dataset_records):
+        print(f"📊 Filtered {len(dataset_records) - len(filtered_records)} entries with failed traces")
+        dataset_records = filtered_records
     
     # G. Save or Push Dataset
     if len(dataset_records) > 0:
