@@ -23,16 +23,22 @@ class TraceGenerator:
         
         user_prompt = f"PROBLEM:\n{problem_desc}\n\nCODE:\n{code}\n\nExplain the reasoning:"
         
+        # Some models (e.g., gpt-5-mini) don't support custom temperature, only default (1.0)
+        # Only include temperature parameter for models that support it
+        models_without_temp_support = ["gpt-5-mini", "gpt-5-nano"]
+        kwargs = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        }
+        if self.model not in models_without_temp_support:
+            kwargs["temperature"] = 0.3
+        
         for _ in range(3): # Retry logic
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.3
-                )
+                response = self.client.chat.completions.create(**kwargs)
                 return response.choices[0].message.content
             except Exception as e:
                 print(f"OpenAI Error: {e}. Retrying...")
