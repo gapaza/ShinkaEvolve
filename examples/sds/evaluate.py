@@ -207,6 +207,9 @@ def main(program_path: str, results_dir: str):
         # run_output is the JSON string returned from run_sds
         return validate_sds((run_output, problem_data))
     
+    # Get timeout from environment (default 5 seconds for SDS evaluation)
+    eval_timeout = float(os.environ.get("SDS_EVAL_TIMEOUT", "5.0"))
+    
     metrics, correct, error_msg = run_shinka_eval(
         program_path=program_path,
         results_dir=results_dir,
@@ -215,6 +218,7 @@ def main(program_path: str, results_dir: str):
         get_experiment_kwargs=lambda i: {"problem_data": problem_data},
         validate_fn=_validate_wrapper,
         aggregate_metrics_fn=_aggregator_with_context,
+        timeout=eval_timeout,
     )
     
     if correct:

@@ -173,3 +173,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# ShinkaEvolve SDS dataset outputs (timestamped directories)
+examples/sds/sds_dataset_output_*/

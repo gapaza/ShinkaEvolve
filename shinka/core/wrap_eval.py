@@ -4,6 +4,7 @@ import os
 import time
 import numpy as np
 import pickle
+import signal
 from typing import Callable, Any, Dict, List, Tuple, Optional
 
 DEFAULT_METRICS_ON_ERROR = {
@@ -60,6 +61,7 @@ def run_shinka_eval(
     aggregate_metrics_fn: Optional[Callable[[List[Any]], Dict[str, Any]]] = None,
     validate_fn: Optional[Callable[[Any], Tuple[bool, Optional[str]]]] = None,
     default_metrics_on_error: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], bool, Optional[str]]:
     """
     Runs an experiment multiple times, collects results, optionally validates,
@@ -116,7 +118,31 @@ def run_shinka_eval(
                 kwargs = {"seed": i + 1}
 
             start_time = time.perf_counter()
-            run_result = experiment_fn(**kwargs)
+            
+            # Execute with timeout if specified
+            if timeout is not None and timeout > 0:
+                # Use signal-based timeout for Unix (Mac/Linux)
+                # This actually interrupts execution, unlike threading
+                def timeout_handler(signum, frame):
+                    raise TimeoutError(f"Function execution exceeded timeout of {timeout}s")
+                
+                # Set up signal handler (Unix only)
+                old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(int(timeout))  # Set alarm for timeout seconds
+                
+                try:
+                    run_result = experiment_fn(**kwargs)
+                except TimeoutError:
+                    # Timeout occurred - re-raise
+                    raise
+                finally:
+                    # Cancel alarm and restore old handler
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
+            else:
+                # No timeout - execute normally
+                run_result = experiment_fn(**kwargs)
+            
             end_time = time.perf_counter()
 
             all_run_results.append(run_result)

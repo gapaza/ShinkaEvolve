@@ -45,9 +45,13 @@ dependencies = [
     "adjustText",
     "markdown",
     "aiofiles",
-    "google-generativeai",
     "datasets",
     "tqdm",
+]
+
+[project.optional-dependencies]
+gemini = [
+    "google-generativeai",
 ]
 
 [tool.setuptools]

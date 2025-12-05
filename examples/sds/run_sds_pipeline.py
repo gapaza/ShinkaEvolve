@@ -18,6 +18,7 @@ import random
 import numpy as np
 import hashlib
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 from datasets import Dataset
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -83,7 +84,8 @@ Key strategies to explore:
 
 The code should read JSON from stdin with "requirements" and "catalog", and output JSON to stdout with "selection" containing "variables" list.
 
-Be creative and find efficient solutions that maximize the objective while respecting all constraints."""
+Be creative and find efficient solutions that maximize the objective while respecting all constraints. The code must execute very quickly (within seconds) - prioritize time-efficient algorithms and avoid computationally expensive operations.
+"""
     
     return EvolutionConfig(
         task_sys_msg=search_task_sys_msg,
@@ -387,8 +389,12 @@ def main():
         help="OpenAI API Key (optional if in env)"
     )
     parser.add_argument(
-        "--output_dir", type=str, default="sds_dataset_output",
-        help="Output directory for results"
+        "--output_dir", type=str, default=None,
+        help="Output directory for results. If not specified, will be created in script directory with timestamp."
+    )
+    parser.add_argument(
+        "--eval_timeout", type=float, default=5.0,
+        help="Timeout in seconds for code execution during evaluation (default: 5.0)"
     )
     parser.add_argument(
         "--seed", type=int, default=None,
@@ -422,9 +428,32 @@ def main():
     else:
         print("⚠️  No seed provided - results will not be reproducible")
     
-    # Create output directory
-    output_dir = Path(args.output_dir)
+    # Create output directory with timestamp if not specified
+    if args.output_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        output_dir = script_dir / f"sds_dataset_output_{timestamp}"
+    else:
+        output_dir = Path(args.output_dir)
+    
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save run configuration to config file
+    config_data = {
+        "seed": master_seed,
+        "samples": args.samples,
+        "generations": args.generations,
+        "eval_timeout": args.eval_timeout,
+        "workers": args.workers if args.workers is not None else "auto",
+        "output_dir": str(output_dir),
+        "timestamp": datetime.now().isoformat(),
+    }
+    config_file = output_dir / "run_config.json"
+    with open(config_file, "w") as f:
+        json.dump(config_data, f, indent=2)
+    print(f"💾 Saved run configuration to {config_file}")
+    
+    # Set eval timeout in environment for evaluate.py to pick up
+    os.environ["SDS_EVAL_TIMEOUT"] = str(args.eval_timeout)
     
     dataset_records = []
     
@@ -438,6 +467,7 @@ def main():
     print(f"🚀 Starting Pipeline: {args.samples} samples")
     print(f"📁 Output directory: {output_dir}")
     print(f"⚡ Using {num_workers} parallel workers")
+    print(f"⏱️  Evaluation timeout: {args.eval_timeout}s per code execution")
     
     # Process problems in parallel
     if num_workers == 1:
