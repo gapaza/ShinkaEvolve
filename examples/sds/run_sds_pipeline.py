@@ -23,6 +23,14 @@ from dotenv import load_dotenv
 from datasets import Dataset
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+# Try to import huggingface_hub for config file upload
+try:
+    from huggingface_hub import HfApi
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    HF_HUB_AVAILABLE = False
+    HfApi = None
+
 # Try to import tiktoken for accurate token counting
 try:
     import tiktoken
@@ -62,6 +70,14 @@ def create_sds_evolution_config(
     num_generations: int = 10,
     results_dir: str = None,
     script_dir: Path = None,
+    max_parallel_jobs: int = 1,
+    max_patch_attempts: int = 3,
+    max_patch_resamples: int = 3,
+    patch_types: list = None,
+    patch_type_probs: list = None,
+    llm_models: list = None,
+    llm_temperatures: list = None,
+    llm_max_tokens: int = 8192,
 ) -> EvolutionConfig:
     """Create EvolutionConfig for SDS problem."""
     
@@ -87,20 +103,30 @@ The code should read JSON from stdin with "requirements" and "catalog", and outp
 Be creative and find efficient solutions that maximize the objective while respecting all constraints. The code must execute very quickly (within seconds) - prioritize time-efficient algorithms and avoid computationally expensive operations.
 """
     
+    # Set defaults if not provided
+    if patch_types is None:
+        patch_types = ["diff", "full", "cross"]
+    if patch_type_probs is None:
+        patch_type_probs = [0.6, 0.3, 0.1]
+    if llm_models is None:
+        llm_models = ["gpt-5-nano", "gpt-5-mini"]
+    if llm_temperatures is None:
+        llm_temperatures = [0.0, 0.5, 0.7]
+    
     return EvolutionConfig(
         task_sys_msg=search_task_sys_msg,
-        patch_types=["diff", "full", "cross"],
-        patch_type_probs=[0.6, 0.3, 0.1],
+        patch_types=patch_types,
+        patch_type_probs=patch_type_probs,
         num_generations=num_generations,
-        max_parallel_jobs=1,  # Sequential for dataset generation
-        max_patch_resamples=3,
-        max_patch_attempts=3,
+        max_parallel_jobs=max_parallel_jobs,
+        max_patch_resamples=max_patch_resamples,
+        max_patch_attempts=max_patch_attempts,
         job_type="local",
         language="python",
-        llm_models=["gpt-5-nano","gpt-5-mini"],
+        llm_models=llm_models,
         llm_kwargs=dict(
-            temperatures=[0.0, 0.5, 0.7],
-            max_tokens=8192,
+            temperatures=llm_temperatures,
+            max_tokens=llm_max_tokens,
         ),
         embedding_model="text-embedding-3-small",
         init_program_path=str(script_dir / "initial.py") if script_dir else "initial.py",
@@ -108,20 +134,31 @@ Be creative and find efficient solutions that maximize the objective while respe
     )
 
 
-def create_sds_database_config() -> DatabaseConfig:
+def create_sds_database_config(
+    num_islands: int = 2,
+    archive_size: int = 20,
+    parent_selection_strategy: str = "weighted",
+    parent_selection_lambda: float = 10.0,
+    elite_selection_ratio: float = 0.3,
+    num_archive_inspirations: int = 4,
+    num_top_k_inspirations: int = 2,
+    migration_interval: int = 10,
+    migration_rate: float = 0.1,
+    island_elitism: bool = True,
+) -> DatabaseConfig:
     """Create DatabaseConfig for SDS evolution."""
     return DatabaseConfig(
         db_path="evolution_db.sqlite",
-        num_islands=2,
-        archive_size=20,
-        elite_selection_ratio=0.3,
-        num_archive_inspirations=4,
-        num_top_k_inspirations=2,
-        migration_interval=10,
-        migration_rate=0.1,
-        island_elitism=True,
-        parent_selection_strategy="weighted",
-        parent_selection_lambda=10.0,
+        num_islands=num_islands,
+        archive_size=archive_size,
+        elite_selection_ratio=elite_selection_ratio,
+        num_archive_inspirations=num_archive_inspirations,
+        num_top_k_inspirations=num_top_k_inspirations,
+        migration_interval=migration_interval,
+        migration_rate=migration_rate,
+        island_elitism=island_elitism,
+        parent_selection_strategy=parent_selection_strategy,
+        parent_selection_lambda=parent_selection_lambda,
     )
 
 
@@ -178,6 +215,26 @@ def process_single_problem(
     script_dir: Path,
     output_dir: Path,
     api_key: str,
+    # Evolution config parameters
+    max_parallel_jobs: int = 1,
+    max_patch_attempts: int = 3,
+    max_patch_resamples: int = 3,
+    patch_types: list = None,
+    patch_type_probs: list = None,
+    llm_models: list = None,
+    llm_temperatures: list = None,
+    llm_max_tokens: int = 8192,
+    # Database config parameters
+    num_islands: int = 2,
+    archive_size: int = 20,
+    parent_selection_strategy: str = "weighted",
+    parent_selection_lambda: float = 10.0,
+    elite_selection_ratio: float = 0.3,
+    num_archive_inspirations: int = 4,
+    num_top_k_inspirations: int = 2,
+    migration_interval: int = 10,
+    migration_rate: float = 0.1,
+    island_elitism: bool = True,
 ) -> dict:
     """
     Process a single SDS problem through ShinkaEvolve evolution.
@@ -258,8 +315,27 @@ def process_single_problem(
             num_generations=num_generations,
             results_dir=str(problem_results_dir.resolve()),
             script_dir=script_dir,
+            max_parallel_jobs=max_parallel_jobs,
+            max_patch_attempts=max_patch_attempts,
+            max_patch_resamples=max_patch_resamples,
+            patch_types=patch_types,
+            patch_type_probs=patch_type_probs,
+            llm_models=llm_models,
+            llm_temperatures=llm_temperatures,
+            llm_max_tokens=llm_max_tokens,
         )
-        db_config = create_sds_database_config()
+        db_config = create_sds_database_config(
+            num_islands=num_islands,
+            archive_size=archive_size,
+            parent_selection_strategy=parent_selection_strategy,
+            parent_selection_lambda=parent_selection_lambda,
+            elite_selection_ratio=elite_selection_ratio,
+            num_archive_inspirations=num_archive_inspirations,
+            num_top_k_inspirations=num_top_k_inspirations,
+            migration_interval=migration_interval,
+            migration_rate=migration_rate,
+            island_elitism=island_elitism,
+        )
         # EvolutionRunner will prepend results_dir, so just use filename
         db_config.db_path = "evolution_db.sqlite"
         
@@ -421,7 +497,89 @@ def main():
              "If not specified, defaults to number of CPU cores. "
              "Set to 1 for sequential processing."
     )
+    
+    # Evolution config arguments
+    parser.add_argument(
+        "--max_parallel_jobs", type=int, default=1,
+        help="Max parallel jobs within each problem's evolution (default: 1)"
+    )
+    parser.add_argument(
+        "--max_patch_attempts", type=int, default=3,
+        help="Max attempts to generate valid patches (default: 3)"
+    )
+    parser.add_argument(
+        "--max_patch_resamples", type=int, default=3,
+        help="Max resamples if patch fails validation (default: 3)"
+    )
+    parser.add_argument(
+        "--patch_types", type=str, nargs="+", default=["diff", "full", "cross"],
+        help="Patch types: diff, full, cross (default: diff full cross)"
+    )
+    parser.add_argument(
+        "--patch_type_probs", type=float, nargs="+", default=[0.6, 0.3, 0.1],
+        help="Probabilities for each patch type (default: 0.6 0.3 0.1)"
+    )
+    parser.add_argument(
+        "--llm_models", type=str, nargs="+", default=["gpt-5-nano", "gpt-5-mini"],
+        help="LLM models for mutations (default: gpt-5-nano gpt-5-mini)"
+    )
+    parser.add_argument(
+        "--llm_temperatures", type=float, nargs="+", default=[0.0, 0.5, 0.7],
+        help="LLM temperatures (default: 0.0 0.5 0.7)"
+    )
+    parser.add_argument(
+        "--llm_max_tokens", type=int, default=8192,
+        help="Max tokens for LLM generation (default: 8192)"
+    )
+    
+    # Database config arguments
+    parser.add_argument(
+        "--num_islands", type=int, default=2,
+        help="Number of evolutionary islands (default: 2)"
+    )
+    parser.add_argument(
+        "--archive_size", type=int, default=20,
+        help="Size of elite solution archive per island (default: 20)"
+    )
+    parser.add_argument(
+        "--parent_selection_strategy", type=str, default="weighted",
+        choices=["weighted", "power_law", "beam_search", "uniform"],
+        help="Parent selection strategy (default: weighted)"
+    )
+    parser.add_argument(
+        "--parent_selection_lambda", type=float, default=10.0,
+        help="Lambda for weighted parent selection (default: 10.0)"
+    )
+    parser.add_argument(
+        "--elite_selection_ratio", type=float, default=0.3,
+        help="Fraction of elite programs for inspiration (default: 0.3)"
+    )
+    parser.add_argument(
+        "--num_archive_inspirations", type=int, default=4,
+        help="Number of programs drawn from archive (default: 4)"
+    )
+    parser.add_argument(
+        "--num_top_k_inspirations", type=int, default=2,
+        help="Number of top programs from current generation (default: 2)"
+    )
+    parser.add_argument(
+        "--migration_interval", type=int, default=10,
+        help="Generations between island migrations (default: 10)"
+    )
+    parser.add_argument(
+        "--migration_rate", type=float, default=0.1,
+        help="Fraction of population to migrate (default: 0.1)"
+    )
+    parser.add_argument(
+        "--no_island_elitism", dest="island_elitism", action="store_false",
+        help="Disable island elitism (default: enabled)"
+    )
+    
     args = parser.parse_args()
+    
+    # Set default for island_elitism if not explicitly set
+    if not hasattr(args, 'island_elitism'):
+        args.island_elitism = True
     
     load_dotenv()
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
@@ -460,6 +618,26 @@ def main():
         "workers": args.workers if args.workers is not None else "auto",
         "output_dir": str(output_dir),
         "timestamp": datetime.now().isoformat(),
+        # Evolution config
+        "max_parallel_jobs": args.max_parallel_jobs,
+        "max_patch_attempts": args.max_patch_attempts,
+        "max_patch_resamples": args.max_patch_resamples,
+        "patch_types": args.patch_types,
+        "patch_type_probs": args.patch_type_probs,
+        "llm_models": args.llm_models,
+        "llm_temperatures": args.llm_temperatures,
+        "llm_max_tokens": args.llm_max_tokens,
+        # Database config
+        "num_islands": args.num_islands,
+        "archive_size": args.archive_size,
+        "parent_selection_strategy": args.parent_selection_strategy,
+        "parent_selection_lambda": args.parent_selection_lambda,
+        "elite_selection_ratio": args.elite_selection_ratio,
+        "num_archive_inspirations": args.num_archive_inspirations,
+        "num_top_k_inspirations": args.num_top_k_inspirations,
+        "migration_interval": args.migration_interval,
+        "migration_rate": args.migration_rate,
+        "island_elitism": args.island_elitism,
     }
     config_file = output_dir / "run_config.json"
     with open(config_file, "w") as f:
@@ -495,6 +673,24 @@ def main():
                 script_dir=script_dir,
                 output_dir=output_dir,
                 api_key=api_key,
+                max_parallel_jobs=args.max_parallel_jobs,
+                max_patch_attempts=args.max_patch_attempts,
+                max_patch_resamples=args.max_patch_resamples,
+                patch_types=args.patch_types,
+                patch_type_probs=args.patch_type_probs,
+                llm_models=args.llm_models,
+                llm_temperatures=args.llm_temperatures,
+                llm_max_tokens=args.llm_max_tokens,
+                num_islands=args.num_islands,
+                archive_size=args.archive_size,
+                parent_selection_strategy=args.parent_selection_strategy,
+                parent_selection_lambda=args.parent_selection_lambda,
+                elite_selection_ratio=args.elite_selection_ratio,
+                num_archive_inspirations=args.num_archive_inspirations,
+                num_top_k_inspirations=args.num_top_k_inspirations,
+                migration_interval=args.migration_interval,
+                migration_rate=args.migration_rate,
+                island_elitism=args.island_elitism,
             )
             if result is not None:
                 dataset_records.append(result)
@@ -512,6 +708,24 @@ def main():
                     script_dir=script_dir,
                     output_dir=output_dir,
                     api_key=api_key,
+                    max_parallel_jobs=args.max_parallel_jobs,
+                    max_patch_attempts=args.max_patch_attempts,
+                    max_patch_resamples=args.max_patch_resamples,
+                    patch_types=args.patch_types,
+                    patch_type_probs=args.patch_type_probs,
+                    llm_models=args.llm_models,
+                    llm_temperatures=args.llm_temperatures,
+                    llm_max_tokens=args.llm_max_tokens,
+                    num_islands=args.num_islands,
+                    archive_size=args.archive_size,
+                    parent_selection_strategy=args.parent_selection_strategy,
+                    parent_selection_lambda=args.parent_selection_lambda,
+                    elite_selection_ratio=args.elite_selection_ratio,
+                    num_archive_inspirations=args.num_archive_inspirations,
+                    num_top_k_inspirations=args.num_top_k_inspirations,
+                    migration_interval=args.migration_interval,
+                    migration_rate=args.migration_rate,
+                    island_elitism=args.island_elitism,
                 ): i
                 for i in range(args.samples)
             }
@@ -586,8 +800,30 @@ def main():
         for repo_name in repos_to_push:
             print(f"📤 Pushing to HuggingFace: {repo_name}...")
             try:
+                # Push the dataset (this creates/updates the repository)
                 ds.push_to_hub(repo_name, token=hf_token, private=True)
-                print(f"✅ Successfully pushed to {repo_name}")
+                print(f"✅ Successfully pushed dataset to {repo_name}")
+                
+                # Upload the config file as a separate file in the repository
+                # This doesn't affect the dataset structure - it's just metadata
+                # The config file will appear in the repository root, separate from the dataset files
+                if HF_HUB_AVAILABLE and config_file.exists():
+                    try:
+                        api = HfApi(token=hf_token)
+                        api.upload_file(
+                            path_or_fileobj=str(config_file),
+                            path_in_repo="run_config.json",
+                            repo_id=repo_name,
+                            repo_type="dataset",
+                            commit_message=f"Add run configuration for {len(dataset_records)} samples"
+                        )
+                        print(f"✅ Successfully uploaded run_config.json to {repo_name}")
+                    except Exception as config_error:
+                        print(f"⚠️  Warning: Could not upload config file to {repo_name}: {config_error}")
+                        print(f"   Dataset was pushed successfully, but config file upload failed")
+                elif not HF_HUB_AVAILABLE:
+                    print(f"⚠️  Warning: huggingface_hub not available, skipping config file upload")
+                
                 success_count += 1
             except Exception as e:
                 print(f"❌ Error pushing to {repo_name}: {e}")
