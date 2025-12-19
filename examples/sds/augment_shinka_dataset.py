@@ -23,6 +23,7 @@ from typing import Dict, List, Any, Tuple
 from tqdm import tqdm
 from datasets import load_dataset, Dataset
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Calculate paths: script is in deps/ShinkaEvolve/examples/sds/
 # Project root is 4 levels up
@@ -212,9 +213,9 @@ def augment_single_sample(
     original_sample: Dict[str, Any],
     original_index: int,
     master_seed: int,
-    tracer: TraceGenerator,
+    api_key: str,
     num_variations: int = 10,
-) -> List[Dict[str, Any]]:
+) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Create augmented variations for a single original sample.
     
@@ -222,19 +223,22 @@ def augment_single_sample(
         original_sample: Original dataset sample
         original_index: Index of the original sample
         master_seed: Master seed for reproducibility
-        tracer: TraceGenerator for paraphrasing
+        api_key: OpenAI API key for creating tracer
         num_variations: Number of variations to create (default: 10)
     
     Returns:
-        List of augmented samples
+        Tuple of (original_index, list of augmented samples)
     """
+    # Create tracer per worker (thread-safe)
+    tracer = TraceGenerator(api_key=api_key, model="gpt-5-mini")
+    
     augmented_samples = []
     
     # Extract original data
     messages = original_sample.get("messages", [])
     if len(messages) < 2:
         print(f"   ⚠️  Sample {original_index} has invalid messages format, skipping")
-        return []
+        return (original_index, [])
     
     assistant_content = messages[1].get("content", "")
     original_code = extract_code_from_assistant(assistant_content)
@@ -242,11 +246,11 @@ def augment_single_sample(
     
     if not original_code:
         print(f"   ⚠️  Sample {original_index} has no code block, skipping")
-        return []
+        return (original_index, [])
     
     if not original_trace:
         print(f"   ⚠️  Sample {original_index} has no thinking trace, skipping")
-        return []
+        return (original_index, [])
     
     original_score = original_sample.get("score", 0.0)
     original_type = original_sample.get("type", "dense")
@@ -305,7 +309,7 @@ def augment_single_sample(
         
         augmented_samples.append(augmented_sample)
     
-    return augmented_samples
+    return (original_index, augmented_samples)
 
 
 def main():
@@ -336,6 +340,14 @@ def main():
         action="store_true",
         help="Skip pushing to HuggingFace (only generate locally)"
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers for augmentation. "
+             "If not specified, defaults to number of CPU cores. "
+             "Set to 1 for sequential processing."
+    )
     
     args = parser.parse_args()
     
@@ -356,8 +368,12 @@ def main():
         print("⚠️  HF_TOKEN not found. Use --skip_push to skip uploading, or set HF_TOKEN")
         return
     
-    # Initialize trace generator
-    tracer = TraceGenerator(api_key=api_key, model="gpt-5-mini")
+    # Determine number of workers
+    if args.workers is None:
+        import multiprocessing
+        num_workers = multiprocessing.cpu_count()
+    else:
+        num_workers = max(1, args.workers)
     
     for seed in args.seeds:
         print(f"\n{'='*80}")
@@ -377,17 +393,58 @@ def main():
         
         # Augment samples
         print(f"🔄 Augmenting samples (creating {args.num_variations} variations each)...")
-        augmented_samples = []
         
-        for i, original_sample in enumerate(tqdm(original_dataset, desc="Augmenting")):
-            variations = augment_single_sample(
-                original_sample=original_sample,
-                original_index=i,
-                master_seed=seed,
-                tracer=tracer,
-                num_variations=args.num_variations,
-            )
-            augmented_samples.extend(variations)
+        # Convert dataset to list for parallel processing
+        original_samples_list = list(original_dataset)
+        
+        if num_workers == 1:
+            # Sequential processing (easier debugging)
+            print("🔄 Running in sequential mode (workers=1)")
+            augmented_samples = []
+            for i, original_sample in enumerate(tqdm(original_samples_list, desc="Augmenting")):
+                _, variations = augment_single_sample(
+                    original_sample=original_sample,
+                    original_index=i,
+                    master_seed=seed,
+                    api_key=api_key,
+                    num_variations=args.num_variations,
+                )
+                augmented_samples.extend(variations)
+        else:
+            # Parallel processing
+            print(f"⚡ Running in parallel mode ({num_workers} workers)")
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all samples
+                future_to_index = {
+                    executor.submit(
+                        augment_single_sample,
+                        original_sample=original_samples_list[i],
+                        original_index=i,
+                        master_seed=seed,
+                        api_key=api_key,
+                        num_variations=args.num_variations,
+                    ): i
+                    for i in range(len(original_samples_list))
+                }
+                
+                # Collect results as they complete (with progress bar)
+                completed_results = {}
+                with tqdm(total=len(original_samples_list), desc="Augmenting") as pbar:
+                    for future in as_completed(future_to_index):
+                        i = future_to_index[future]
+                        try:
+                            orig_idx, variations = future.result()
+                            if variations:
+                                completed_results[orig_idx] = variations
+                        except Exception as e:
+                            print(f"   ❌ Sample {i} failed with exception: {e}")
+                        finally:
+                            pbar.update(1)
+                
+                # Sort by original index to maintain deterministic order
+                augmented_samples = []
+                for orig_idx in sorted(completed_results.keys()):
+                    augmented_samples.extend(completed_results[orig_idx])
         
         print(f"✅ Generated {len(augmented_samples)} augmented samples")
         
