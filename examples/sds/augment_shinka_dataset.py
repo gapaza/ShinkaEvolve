@@ -455,7 +455,16 @@ def main():
         # Create dataset
         augmented_dataset = Dataset.from_list(augmented_samples)
         
+        # Save locally as temporary backup (save in script directory)
+        output_file = script_dir / f"shinka_augmented_seed{seed}.jsonl"
+        print(f"💾 Saving local backup to {output_file}...")
+        with open(output_file, "w") as f:
+            for sample in augmented_samples:
+                f.write(json.dumps(sample) + "\n")
+        print(f"✅ Saved {len(augmented_samples)} samples to {output_file}")
+        
         # Push to HuggingFace
+        push_successful = True
         if not args.skip_push:
             repos_to_push = [
                 f"SoheylM/ShinkaEvolve-SDS-1000-seed{seed}",
@@ -473,16 +482,16 @@ def main():
                     print(f"✅ Successfully pushed to {repo_name}")
                 except Exception as e:
                     print(f"❌ Error pushing to {repo_name}: {e}")
+                    push_successful = False
         else:
             print("⏭️  Skipping push to HuggingFace (--skip_push)")
+            push_successful = False  # Keep file if skip_push is used
         
-        # Save locally as backup (save in script directory)
-        output_file = script_dir / f"shinka_augmented_seed{seed}.jsonl"
-        print(f"💾 Saving local backup to {output_file}...")
-        with open(output_file, "w") as f:
-            for sample in augmented_samples:
-                f.write(json.dumps(sample) + "\n")
-        print(f"✅ Saved {len(augmented_samples)} samples to {output_file}")
+        # Clean up local file after successful push
+        if push_successful and not args.skip_push:
+            if output_file.exists():
+                output_file.unlink()
+                print(f"🗑️  Cleaned up local backup file: {output_file}")
     
     print(f"\n{'='*80}")
     print("✅ Augmentation complete!")
