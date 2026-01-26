@@ -11,19 +11,23 @@ This script:
 3. Pushes expanded datasets to both SoheylM and IDEALLab organizations
 """
 
-import os
-import json
 import argparse
 import hashlib
+import json
+import multiprocessing
+import os
 import random
 import re
 import sys
-from pathlib import Path
-from typing import Dict, List, Any, Tuple
-from tqdm import tqdm
-from datasets import load_dataset, Dataset
-from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+from datasets import Dataset, load_dataset
+from dotenv import load_dotenv
+from tqdm import tqdm
+
+_MIN_MESSAGES_COUNT = 2
 
 # Calculate paths: script is in deps/ShinkaEvolve/examples/sds/
 # Project root is 4 levels up
@@ -37,20 +41,20 @@ if str(project_root) not in sys.path:
 # Import problem generation functions
 try:
     from data.gen_sds_dataset import (
-        sds_render_prompt,
         _instance_to_problem,
         make_dense_instance,
         make_tree_instance,
+        sds_render_prompt,
     )
 except ImportError:
-    print(f"❌ Could not import gen_sds_dataset.py.")
+    print("❌ Could not import gen_sds_dataset.py.")
     print(f"   Script dir: {script_dir}")
     print(f"   Project root: {project_root}")
     print(f"   Looking for: {project_root / 'data' / 'gen_sds_dataset.py'}")
     sys.exit(1)
 
 # Import ShinkaEvolve utilities (already in path from project_root)
-from shinka.annotation.trace_generator import TraceGenerator
+from shinka.annotation.trace_generator import TraceGenerator  # noqa: E402
 
 # Try to import tiktoken for token counting
 try:
@@ -107,7 +111,7 @@ def paraphrase_trace(
     original_trace: str,
     problem_prompt: str,
     code: str,
-    seed: int,
+    seed: int,  # noqa: ARG001
 ) -> str:
     """
     Paraphrase the original thinking trace using GPT-5-mini.
@@ -152,10 +156,10 @@ def paraphrase_trace(
         
         # Filter out failed generations
         if "Analysis failed." in paraphrased or not paraphrased:
-            print(f"   ⚠️  Paraphrase generation failed, using original trace")
+            print("   ⚠️  Paraphrase generation failed, using original trace")
             return original_trace
-        
-        return paraphrased
+        else:
+            return paraphrased
     except Exception as e:
         print(f"   ⚠️  Error paraphrasing trace: {e}, using original trace")
         return original_trace
@@ -166,7 +170,7 @@ def generate_new_problem(
     original_index: int,
     variation_index: int,
     master_seed: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Generate a new problem instance matching the original type (dense or tree).
     
@@ -210,12 +214,12 @@ def generate_new_problem(
 
 
 def augment_single_sample(
-    original_sample: Dict[str, Any],
+    original_sample: dict[str, Any],
     original_index: int,
     master_seed: int,
     api_key: str,
     num_variations: int = 10,
-) -> Tuple[int, List[Dict[str, Any]]]:
+) -> tuple[int, list[dict[str, Any]]]:
     """
     Create augmented variations for a single original sample.
     
@@ -236,7 +240,7 @@ def augment_single_sample(
     
     # Extract original data
     messages = original_sample.get("messages", [])
-    if len(messages) < 2:
+    if len(messages) < _MIN_MESSAGES_COUNT:
         print(f"   ⚠️  Sample {original_index} has invalid messages format, skipping")
         return (original_index, [])
     
@@ -312,7 +316,7 @@ def augment_single_sample(
     return (original_index, augmented_samples)
 
 
-def main():
+def main():  # noqa: PLR0912, PLR0915
     parser = argparse.ArgumentParser(
         description="Augment ShinkaEvolve SDS datasets from 100 to 1000 samples"
     )
@@ -361,7 +365,7 @@ def main():
     
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise ValueError("OpenAI API Key required for trace paraphrasing")
+        raise ValueError("OpenAI API Key required for trace paraphrasing")  # noqa: TRY003
     
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token and not args.skip_push:
@@ -370,7 +374,6 @@ def main():
     
     # Determine number of workers
     if args.workers is None:
-        import multiprocessing
         num_workers = multiprocessing.cpu_count()
     else:
         num_workers = max(1, args.workers)
@@ -458,9 +461,8 @@ def main():
         # Save locally as temporary backup (save in script directory)
         output_file = script_dir / f"shinka_augmented_seed{seed}.jsonl"
         print(f"💾 Saving local backup to {output_file}...")
-        with open(output_file, "w") as f:
-            for sample in augmented_samples:
-                f.write(json.dumps(sample) + "\n")
+        with output_file.open("w") as f:
+            f.writelines(json.dumps(sample) + "\n" for sample in augmented_samples)
         print(f"✅ Saved {len(augmented_samples)} samples to {output_file}")
         
         # Push to HuggingFace
@@ -488,10 +490,9 @@ def main():
             push_successful = False  # Keep file if skip_push is used
         
         # Clean up local file after successful push
-        if push_successful and not args.skip_push:
-            if output_file.exists():
-                output_file.unlink()
-                print(f"🗑️  Cleaned up local backup file: {output_file}")
+        if push_successful and not args.skip_push and output_file.exists():
+            output_file.unlink()
+            print(f"🗑️  Cleaned up local backup file: {output_file}")
     
     print(f"\n{'='*80}")
     print("✅ Augmentation complete!")

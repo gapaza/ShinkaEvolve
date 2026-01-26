@@ -3,18 +3,16 @@ Evaluator for Synergistic Dependency Selection (SDS) problem.
 Uses ShinkaEvolve's run_shinka_eval pattern.
 """
 
-import os
-import json
-import sys
-import io
-import contextlib
 import argparse
-from typing import Dict, Any, Tuple, List, Optional
+import json
+import os
+from pathlib import Path
+from typing import Any
 
 from shinka.core import run_shinka_eval
 
 
-def _check_feasibility(selection: List[int], requirements: Dict[str, Any]) -> Tuple[bool, int]:
+def _check_feasibility(selection: list[int], requirements: dict[str, Any]) -> tuple[bool, int]:
     """
     Check if a selection satisfies all feasibility constraints.
     Returns (is_valid, violation_count).
@@ -23,7 +21,7 @@ def _check_feasibility(selection: List[int], requirements: Dict[str, Any]) -> Tu
     violations = 0
     
     # A. Cardinality
-    L, U = requirements.get("cardinality_bounds", [0, 9999])
+    L, U = requirements.get("cardinality_bounds", [0, 9999])  # noqa: N806
     if not (L <= len(sel_set) <= U):
         violations += 1
         
@@ -45,7 +43,7 @@ def _check_feasibility(selection: List[int], requirements: Dict[str, Any]) -> Tu
     return (violations == 0), violations
 
 
-def _calculate_score(selection: List[int], requirements: Dict[str, Any]) -> float:
+def _calculate_score(selection: list[int], requirements: dict[str, Any]) -> float:
     """
     Calculate the objective score for a valid selection.
     """
@@ -65,13 +63,13 @@ def _calculate_score(selection: List[int], requirements: Dict[str, Any]) -> floa
             u, w = map(int, k.split(","))
             if u in sel_set and w in sel_set:
                 total += v
-        except:
+        except Exception:
             pass
             
     return total
 
 
-def validate_sds(run_output: Tuple[str, Dict[str, Any]]) -> Tuple[bool, Optional[str]]:
+def validate_sds(run_output: tuple[str, dict[str, Any]]) -> tuple[bool, str | None]:
     """
     Validates SDS solution output.
     
@@ -101,7 +99,7 @@ def validate_sds(run_output: Tuple[str, Dict[str, Any]]) -> Tuple[bool, Optional
     return True, None
 
 
-def get_sds_kwargs(run_index: int) -> Dict[str, Any]:
+def get_sds_kwargs(run_index: int) -> dict[str, Any]:  # noqa: ARG001
     """
     Provides keyword arguments for SDS runs.
     The problem data is passed via environment variable SDS_PROBLEM_DATA.
@@ -110,15 +108,15 @@ def get_sds_kwargs(run_index: int) -> Dict[str, Any]:
     problem_data_str = os.environ.get("SDS_PROBLEM_DATA", "{}")
     try:
         problem_data = json.loads(problem_data_str)
-    except:
+    except Exception:
         problem_data = {}
     
     return {"problem_data": problem_data}
 
 
 def aggregate_sds_metrics(
-    results: List[Tuple[str, Dict[str, Any]]], results_dir: str
-) -> Dict[str, Any]:
+    results: list[tuple[str, dict[str, Any]]], results_dir: str  # noqa: ARG001
+) -> dict[str, Any]:
     """
     Aggregates metrics for SDS evaluation.
     """
@@ -131,7 +129,7 @@ def aggregate_sds_metrics(
     try:
         out_json = json.loads(stdout_str)
         selection = out_json.get("selection", {}).get("variables", [])
-    except:
+    except Exception:
         return {"combined_score": 0.0, "error": "Failed to parse output"}
     
     # Check feasibility
@@ -184,26 +182,26 @@ def main(program_path: str, results_dir: str):
     """
     print(f"Evaluating program: {program_path}")
     print(f"Saving results to: {results_dir}")
-    os.makedirs(results_dir, exist_ok=True)
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
     
     # Get problem data from environment
     problem_data_str = os.environ.get("SDS_PROBLEM_DATA", "{}")
     try:
         problem_data = json.loads(problem_data_str)
-    except:
+    except Exception:
         print("Warning: Could not parse SDS_PROBLEM_DATA, using empty dict")
         problem_data = {}
     
-    requirements = problem_data.get("requirements", {})
-    catalog = problem_data.get("catalog", {})
+    _requirements = problem_data.get("requirements", {})
+    _catalog = problem_data.get("catalog", {})
     
     # Use run_shinka_eval pattern
-    def _aggregator_with_context(r: List[str]) -> Dict[str, Any]:
+    def _aggregator_with_context(r: list[str]) -> dict[str, Any]:
         # r is a list of return values (JSON strings) from run_sds
         stdout_str = r[0] if r else ""
         return aggregate_sds_metrics([(stdout_str, problem_data)], results_dir)
     
-    def _validate_wrapper(run_output: str) -> Tuple[bool, Optional[str]]:
+    def _validate_wrapper(run_output: str) -> tuple[bool, str | None]:
         # run_output is the JSON string returned from run_sds
         return validate_sds((run_output, problem_data))
     
@@ -215,7 +213,7 @@ def main(program_path: str, results_dir: str):
         results_dir=results_dir,
         experiment_fn_name="run_sds",
         num_runs=1,
-        get_experiment_kwargs=lambda i: {"problem_data": problem_data},
+        get_experiment_kwargs=lambda _: {"problem_data": problem_data},
         validate_fn=_validate_wrapper,
         aggregate_metrics_fn=_aggregator_with_context,
         timeout=eval_timeout,

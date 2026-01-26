@@ -3,12 +3,13 @@ Initial solution for Synergistic Dependency Selection (SDS) problem.
 The code in EVOLVE-BLOCK will be evolved by ShinkaEvolve.
 """
 
+import contextlib
 import json
 import sys
-import contextlib
+
 
 # EVOLVE-BLOCK-START
-def solve_sds():
+def solve_sds():  # noqa: PLR0912, PLR0915
     """
     Solve the Synergistic Dependency Selection problem.
     
@@ -20,7 +21,7 @@ def solve_sds():
     # Read input
     input_data = json.load(sys.stdin)
     requirements = input_data.get("requirements", {})
-    catalog = input_data.get("catalog", {})
+    _catalog = input_data.get("catalog", {})
     
     # Extract constraints
     weights = requirements.get("weights", [])
@@ -43,9 +44,9 @@ def solve_sds():
         for k, v in interactions.items():
             try:
                 u, w = map(int, k.split(","))
-                if u == i or w == i:
+                if i in (u, w):
                     score += abs(v) * 0.5  # Potential value
-            except:
+            except Exception:
                 pass
         scores.append((score, i))
     
@@ -54,7 +55,7 @@ def solve_sds():
     
     # Greedy selection respecting constraints
     selected_set = set()
-    for score, i in scores:
+    for _score, i in scores:
         if len(selected_set) >= cardinality_bounds[1]:
             break
             
@@ -117,16 +118,11 @@ def run_sds(problem_data=None):
     Can accept problem_data as parameter or read from stdin.
     Returns JSON string (for ShinkaEvolve) or prints to stdout (for direct execution).
     """
-    import sys
-    import json
-    import io
+    import io  # noqa: PLC0415
+    import json  # noqa: PLC0415
+    import sys  # noqa: PLC0415
     
-    if problem_data is None:
-        # Read from stdin (for compatibility)
-        input_data = json.load(sys.stdin)
-    else:
-        # Use provided problem data
-        input_data = problem_data
+    input_data = json.load(sys.stdin) if problem_data is None else problem_data
     
     # Capture stdout from solve_sds
     stdout_capture = io.StringIO()

@@ -5,11 +5,11 @@ This can be used for single problem evolution.
 For batch dataset generation, use run_sds_pipeline.py
 """
 
-from shinka.core import EvolutionRunner, EvolutionConfig
+import os
+
+from shinka.core import EvolutionConfig, EvolutionRunner
 from shinka.database import DatabaseConfig
 from shinka.launch import LocalJobConfig
-import os
-import json
 
 # Job configuration
 job_config = LocalJobConfig(eval_program_path="evaluate.py")
@@ -63,10 +63,10 @@ evo_config = EvolutionConfig(
     job_type="local",
     language="python",
     llm_models=["gpt-4o"],
-    llm_kwargs=dict(
-        temperatures=[0.0, 0.5, 0.7],
-        max_tokens=8192,
-    ),
+      llm_kwargs={
+        "temperatures": [0.0, 0.5, 0.7],
+        "max_tokens": 8192,
+    },
     embedding_model="text-embedding-3-small",
     init_program_path="initial.py",
     results_dir=None,  # Auto-generated

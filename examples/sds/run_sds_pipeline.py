@@ -9,19 +9,24 @@ This script:
 5. Formats data for student model training
 """
 
-import os
-import json
 import argparse
-import tqdm
-import sys
-import random
-import numpy as np
 import hashlib
-from pathlib import Path
-from datetime import datetime
-from dotenv import load_dotenv
-from datasets import Dataset
+import json
+import multiprocessing
+import os
+import random
+import sys
+import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+
+_MIN_FITNESS_THRESHOLD = 0.01
+_KILO_THRESHOLD = 1000
+
+import tqdm  # noqa: E402
+from datasets import Dataset  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
 
 # Try to import huggingface_hub for config file upload
 try:
@@ -48,35 +53,39 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 # ShinkaEvolve imports
-from shinka.core import EvolutionRunner, EvolutionConfig
-from shinka.database import DatabaseConfig, ProgramDatabase
-from shinka.launch import LocalJobConfig
-from shinka.annotation.trace_generator import TraceGenerator
+from shinka.annotation.trace_generator import TraceGenerator  # noqa: E402
+from shinka.core import EvolutionConfig, EvolutionRunner  # noqa: E402
+from shinka.database import DatabaseConfig, ProgramDatabase  # noqa: E402
+from shinka.launch import LocalJobConfig  # noqa: E402
 
 # Import problem generation from data directory
 try:
-    from data.gen_sds_dataset import sds_render_prompt, _instance_to_problem
-    from data.gen_sds_dataset import make_dense_instance, make_tree_instance
+    from data.gen_sds_dataset import (
+        _instance_to_problem,
+        make_dense_instance,
+        make_tree_instance,
+        sds_render_prompt,
+    )
 except ImportError:
-    print(f"❌ Could not import gen_sds_dataset.py.")
+    print("❌ Could not import gen_sds_dataset.py.")
     print(f"   Script dir: {script_dir}")
     print(f"   Project root: {project_root}")
     print(f"   Looking for: {project_root / 'data' / 'gen_sds_dataset.py'}")
     sys.exit(1)
 
 
-def create_sds_evolution_config(
-    problem_data: dict,
+def create_sds_evolution_config(  # noqa: PLR0913
+    problem_data: dict,  # noqa: ARG001
     num_generations: int = 10,
-    results_dir: str = None,
-    script_dir: Path = None,
+    results_dir: str | None = None,
+    script_dir: Path | None = None,
     max_parallel_jobs: int = 1,
     max_patch_attempts: int = 3,
     max_patch_resamples: int = 3,
-    patch_types: list = None,
-    patch_type_probs: list = None,
-    llm_models: list = None,
-    llm_temperatures: list = None,
+    patch_types: list | None = None,
+    patch_type_probs: list | None = None,
+    llm_models: list | None = None,
+    llm_temperatures: list | None = None,
     llm_max_tokens: int = 8192,
 ) -> EvolutionConfig:
     """Create EvolutionConfig for SDS problem."""
@@ -124,17 +133,17 @@ Be creative and find efficient solutions that maximize the objective while respe
         job_type="local",
         language="python",
         llm_models=llm_models,
-        llm_kwargs=dict(
-            temperatures=llm_temperatures,
-            max_tokens=llm_max_tokens,
-        ),
+          llm_kwargs={
+            "temperatures": llm_temperatures,
+            "max_tokens": llm_max_tokens,
+        },
         embedding_model="text-embedding-3-small",
         init_program_path=str(script_dir / "initial.py") if script_dir else "initial.py",
         results_dir=results_dir,
     )
 
 
-def create_sds_database_config(
+def create_sds_database_config(  # noqa: PLR0913
     num_islands: int = 2,
     archive_size: int = 20,
     parent_selection_strategy: str = "weighted",
@@ -208,7 +217,7 @@ def count_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def process_single_problem(
+def process_single_problem(  # noqa: PLR0913, PLR0915
     i: int,
     master_seed: int,
     num_generations: int,
@@ -219,10 +228,10 @@ def process_single_problem(
     max_parallel_jobs: int = 1,
     max_patch_attempts: int = 3,
     max_patch_resamples: int = 3,
-    patch_types: list = None,
-    patch_type_probs: list = None,
-    llm_models: list = None,
-    llm_temperatures: list = None,
+    patch_types: list | None = None,
+    patch_type_probs: list | None = None,
+    llm_models: list | None = None,
+    llm_temperatures: list | None = None,
     llm_max_tokens: int = 8192,
     # Database config parameters
     num_islands: int = 2,
@@ -347,7 +356,7 @@ def process_single_problem(
         # Change to script directory so relative paths in evaluate.py work correctly
         # Note: Evolution uses natural randomness to explore diverse solutions
         # and avoid mode collapse. Problem generation is seeded for reproducibility.
-        original_cwd = os.getcwd()
+        original_cwd = Path.cwd()
         try:
             os.chdir(script_dir)  # Change to script directory for evolution
             evo_runner = EvolutionRunner(
@@ -376,13 +385,13 @@ def process_single_problem(
         
         best_code, best_fitness = extract_best_code_from_database(str(db_path))
         
-        if not best_code or best_fitness <= 0.01:
+        if not best_code or best_fitness <= _MIN_FITNESS_THRESHOLD:
             print(f"   ⚠️ Skipping {i}: No valid solution found (fitness: {best_fitness:.4f})")
             return None
         
         # E. Extract only the EVOLVE-BLOCK content (remove markers and fixed code)
         # The best_code from database contains the full file, but we only want the evolved part
-        from shinka.llm import extract_between
+        from shinka.llm import extract_between  # noqa: PLC0415
         evolved_code = extract_between(best_code, "# EVOLVE-BLOCK-START", "# EVOLVE-BLOCK-END", False)
         if not evolved_code or evolved_code == "none":
             # Fallback: if extraction fails, use the full code (shouldn't happen)
@@ -426,7 +435,6 @@ def process_single_problem(
         }
     except Exception as e:
         print(f"   ❌ Error processing problem {i}: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
@@ -444,7 +452,7 @@ def extract_best_code_from_database(db_path: str) -> tuple[str, float]:
     # Ensure db_path is absolute
     db_path_abs = Path(db_path).resolve()
     if not db_path_abs.exists():
-        raise FileNotFoundError(f"Database file not found: {db_path_abs}")
+        raise FileNotFoundError(f"Database file not found: {db_path_abs}")  # noqa: TRY003
     
     db_config = DatabaseConfig(db_path=str(db_path_abs))
     db = ProgramDatabase(config=db_config, read_only=True)
@@ -456,7 +464,7 @@ def extract_best_code_from_database(db_path: str) -> tuple[str, float]:
     return best_program.code, best_program.combined_score or 0.0
 
 
-def main():
+def main():  # noqa: PLR0912, PLR0915
     parser = argparse.ArgumentParser(
         description="Generate SFT dataset for SDS using ShinkaEvolve"
     )
@@ -584,7 +592,7 @@ def main():
     load_dotenv()
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise ValueError("OpenAI API Key required for SFT Data Generation")
+        raise ValueError("OpenAI API Key required for SFT Data Generation")  # noqa: TRY003
     
     # Check for HF_TOKEN if pushing to HuggingFace
     hf_token = os.environ.get("HF_TOKEN")
@@ -640,7 +648,7 @@ def main():
         "island_elitism": args.island_elitism,
     }
     config_file = output_dir / "run_config.json"
-    with open(config_file, "w") as f:
+    with Path(config_file).open("w") as f:
         json.dump(config_data, f, indent=2)
     print(f"💾 Saved run configuration to {config_file}")
     
@@ -651,7 +659,6 @@ def main():
     
     # Determine number of workers
     if args.workers is None:
-        import multiprocessing
         num_workers = multiprocessing.cpu_count()
     else:
         num_workers = max(1, args.workers)
@@ -777,7 +784,7 @@ def main():
             # Auto-generate repo names based on sample count and seed
             total_samples = len(dataset_records)
             # Format sample count for repo name (e.g., 10000 -> "10k", 5000 -> "5k")
-            if total_samples >= 1000:
+            if total_samples >= _KILO_THRESHOLD:
                 sample_suffix = f"{total_samples // 1000}k"
             else:
                 sample_suffix = str(total_samples)
@@ -820,9 +827,9 @@ def main():
                         print(f"✅ Successfully uploaded run_config.json to {repo_name}")
                     except Exception as config_error:
                         print(f"⚠️  Warning: Could not upload config file to {repo_name}: {config_error}")
-                        print(f"   Dataset was pushed successfully, but config file upload failed")
+                        print("   Dataset was pushed successfully, but config file upload failed")
                 elif not HF_HUB_AVAILABLE:
-                    print(f"⚠️  Warning: huggingface_hub not available, skipping config file upload")
+                    print("⚠️  Warning: huggingface_hub not available, skipping config file upload")
                 
                 success_count += 1
             except Exception as e:
@@ -831,18 +838,17 @@ def main():
         if success_count > 0:
             print(f"✅ Successfully pushed to {success_count}/{len(repos_to_push)} repositories")
         else:
-            print(f"❌ Failed to push to any repository")
+            print("❌ Failed to push to any repository")
         
         # Always save locally as backup
         output_file = output_dir / "sft_dataset.jsonl"
-        with open(output_file, "w") as f:
-            for r in dataset_records:
-                f.write(json.dumps(r) + "\n")
+        with Path(output_file).open("w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in dataset_records)
         print(f"💾 Saved local backup to {output_file}")
         
         # Also save as JSON for easy inspection
         json_file = output_dir / "sft_dataset.json"
-        with open(json_file, "w") as f:
+        with Path(json_file).open("w") as f:
             json.dump(dataset_records, f, indent=2)
         print(f"💾 Also saved to {json_file}")
     else:
