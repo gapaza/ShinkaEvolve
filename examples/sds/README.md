@@ -63,9 +63,7 @@ python deps/ShinkaEvolve/examples/sds/run_sds_pipeline.py \
 - **`--workers`** (default: CPU count): Number of parallel workers for problem processing. Set to 1 for sequential processing.
 - **`--eval_timeout`** (default: 5.0): Timeout in seconds for code execution during evaluation. Prevents runaway processes from slow LLM-generated code. Use `null` or omit for no timeout (not recommended for large runs).
 - **`--output_dir`** (optional): Output directory for results. If not specified, creates a timestamped directory: `sds_dataset_output_YYYYMMDDHHMMSS` in the script directory.
-- **`--push_to`** (optional): HuggingFace repo ID (e.g., `YourOrg/SDS-Dataset`). If not provided, auto-generates names based on sample count and seed:
-  - `SoheylM/ShinkaEvolve-SDS-{N}k-seed{seed}`
-  - `IDEALLab/ShinkaEvolve-SDS-{N}k-seed{seed}`
+- **`--push_to`** (optional): HuggingFace repo ID (e.g., `YourOrg/SDS-Dataset`). If not provided, auto-generates names based on sample count and seed (configured in script)
 - **`--api_key`** (optional): OpenAI API Key. Can also be set via `OPENAI_API_KEY` environment variable.
 
 #### Output Structure
@@ -109,7 +107,7 @@ export HF_TOKEN=your_token_here
 python run_sds_pipeline.py --samples 1000 --seed 303 --push_to YourOrg/SDS-Dataset
 ```
 
-If `--push_to` is not provided, the script auto-generates repository names and pushes to both `SoheylM` and `IDEALLab` organizations.
+If `--push_to` is not provided, the script auto-generates repository names based on configured organizations (see script source for details).
 
 ## Integration with ShinkaEvolve
 
